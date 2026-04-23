@@ -1,0 +1,14 @@
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/serde-e50a1778710e09c2.d: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/build/serde-5707a0989064cba6/out/private.rs
+
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/libserde-e50a1778710e09c2.rlib: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/build/serde-5707a0989064cba6/out/private.rs
+
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/libserde-e50a1778710e09c2.rmeta: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/build/serde-5707a0989064cba6/out/private.rs
+
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/build/serde-5707a0989064cba6/out/private.rs:
+
+# env-dep:OUT_DIR=/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/build/serde-5707a0989064cba6/out

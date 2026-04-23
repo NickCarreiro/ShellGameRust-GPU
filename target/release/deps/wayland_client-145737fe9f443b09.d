@@ -1,0 +1,10 @@
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/wayland_client-145737fe9f443b09.d: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/conn.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/event_queue.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/globals.rs
+
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/libwayland_client-145737fe9f443b09.rlib: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/conn.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/event_queue.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/globals.rs
+
+/home/ncarreiro/Desktop/evasion_tree/ShellGame-rust-v2/target/release/deps/libwayland_client-145737fe9f443b09.rmeta: /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/lib.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/conn.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/event_queue.rs /home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/globals.rs
+
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/lib.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/conn.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/event_queue.rs:
+/home/ncarreiro/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wayland-client-0.31.14/src/globals.rs:

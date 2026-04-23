@@ -1,0 +1,394 @@
+{
+  "history": [
+    {
+      "event": "guess-miss",
+      "key": 3,
+      "shell_key": 22,
+      "snapshot": {
+        "key": 1,
+        "left": {
+          "key": 19,
+          "left": {
+            "key": 20,
+            "left": {
+              "key": 25,
+              "left": {
+                "key": 27,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 26,
+                "left": null,
+                "right": null
+              }
+            },
+            "right": {
+              "key": 21,
+              "left": {
+                "key": 24,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 22,
+                "left": null,
+                "right": {
+                  "key": 23,
+                  "left": null,
+                  "right": null
+                }
+              }
+            }
+          },
+          "right": {
+            "key": 28,
+            "left": {
+              "key": 29,
+              "left": null,
+              "right": {
+                "key": 30,
+                "left": null,
+                "right": null
+              }
+            },
+            "right": {
+              "key": 31,
+              "left": null,
+              "right": null
+            }
+          }
+        },
+        "right": {
+          "key": 2,
+          "left": {
+            "key": 3,
+            "left": {
+              "key": 10,
+              "left": {
+                "key": 13,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 11,
+                "left": null,
+                "right": {
+                  "key": 12,
+                  "left": null,
+                  "right": null
+                }
+              }
+            },
+            "right": {
+              "key": 4,
+              "left": {
+                "key": 8,
+                "left": null,
+                "right": {
+                  "key": 9,
+                  "left": null,
+                  "right": null
+                }
+              },
+              "right": {
+                "key": 5,
+                "left": {
+                  "key": 6,
+                  "left": null,
+                  "right": null
+                },
+                "right": {
+                  "key": 7,
+                  "left": null,
+                  "right": null
+                }
+              }
+            }
+          },
+          "right": {
+            "key": 14,
+            "left": {
+              "key": 17,
+              "left": null,
+              "right": {
+                "key": 18,
+                "left": null,
+                "right": null
+              }
+            },
+            "right": {
+              "key": 15,
+              "left": null,
+              "right": {
+                "key": 16,
+                "left": null,
+                "right": null
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "event": "guess-miss",
+      "key": 25,
+      "shell_key": 15,
+      "snapshot": {
+        "key": 1,
+        "left": {
+          "key": 2,
+          "left": {
+            "key": 14,
+            "left": {
+              "key": 15,
+              "left": null,
+              "right": {
+                "key": 16,
+                "left": null,
+                "right": null
+              }
+            },
+            "right": {
+              "key": 17,
+              "left": null,
+              "right": {
+                "key": 18,
+                "left": null,
+                "right": null
+              }
+            }
+          },
+          "right": {
+            "key": 3,
+            "left": {
+              "key": 10,
+              "left": {
+                "key": 13,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 11,
+                "left": null,
+                "right": {
+                  "key": 12,
+                  "left": null,
+                  "right": null
+                }
+              }
+            },
+            "right": {
+              "key": 4,
+              "left": {
+                "key": 8,
+                "left": {
+                  "key": 9,
+                  "left": null,
+                  "right": null
+                },
+                "right": null
+              },
+              "right": {
+                "key": 5,
+                "left": {
+                  "key": 7,
+                  "left": null,
+                  "right": null
+                },
+                "right": {
+                  "key": 6,
+                  "left": null,
+                  "right": null
+                }
+              }
+            }
+          }
+        },
+        "right": {
+          "key": 19,
+          "left": {
+            "key": 28,
+            "left": {
+              "key": 29,
+              "left": {
+                "key": 30,
+                "left": null,
+                "right": null
+              },
+              "right": null
+            },
+            "right": {
+              "key": 31,
+              "left": null,
+              "right": null
+            }
+          },
+          "right": {
+            "key": 20,
+            "left": {
+              "key": 21,
+              "left": {
+                "key": 24,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 22,
+                "left": null,
+                "right": {
+                  "key": 23,
+                  "left": null,
+                  "right": null
+                }
+              }
+            },
+            "right": {
+              "key": 25,
+              "left": {
+                "key": 26,
+                "left": null,
+                "right": null
+              },
+              "right": {
+                "key": 27,
+                "left": null,
+                "right": null
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "event": "guess-hit",
+      "key": 15,
+      "shell_key": 15,
+      "snapshot": {
+        "key": 15,
+        "left": null,
+        "right": {
+          "key": 1,
+          "left": {
+            "key": 14,
+            "left": {
+              "key": 16,
+              "left": null,
+              "right": null
+            },
+            "right": {
+              "key": 2,
+              "left": {
+                "key": 17,
+                "left": null,
+                "right": {
+                  "key": 18,
+                  "left": null,
+                  "right": null
+                }
+              },
+              "right": {
+                "key": 3,
+                "left": {
+                  "key": 10,
+                  "left": {
+                    "key": 13,
+                    "left": null,
+                    "right": null
+                  },
+                  "right": {
+                    "key": 11,
+                    "left": null,
+                    "right": {
+                      "key": 12,
+                      "left": null,
+                      "right": null
+                    }
+                  }
+                },
+                "right": {
+                  "key": 4,
+                  "left": {
+                    "key": 8,
+                    "left": {
+                      "key": 9,
+                      "left": null,
+                      "right": null
+                    },
+                    "right": null
+                  },
+                  "right": {
+                    "key": 5,
+                    "left": {
+                      "key": 7,
+                      "left": null,
+                      "right": null
+                    },
+                    "right": {
+                      "key": 6,
+                      "left": null,
+                      "right": null
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "right": {
+            "key": 19,
+            "left": {
+              "key": 28,
+              "left": {
+                "key": 29,
+                "left": {
+                  "key": 30,
+                  "left": null,
+                  "right": null
+                },
+                "right": null
+              },
+              "right": {
+                "key": 31,
+                "left": null,
+                "right": null
+              }
+            },
+            "right": {
+              "key": 20,
+              "left": {
+                "key": 21,
+                "left": {
+                  "key": 24,
+                  "left": null,
+                  "right": null
+                },
+                "right": {
+                  "key": 22,
+                  "left": null,
+                  "right": {
+                    "key": 23,
+                    "left": null,
+                    "right": null
+                  }
+                }
+              },
+              "right": {
+                "key": 25,
+                "left": {
+                  "key": 26,
+                  "left": null,
+                  "right": null
+                },
+                "right": {
+                  "key": 27,
+                  "left": null,
+                  "right": null
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
