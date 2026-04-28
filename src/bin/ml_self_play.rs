@@ -49,6 +49,24 @@ enum Command {
         /// Adam learning rate for the OpenAI-ES gradient update.
         #[arg(long, default_value_t = 0.01)]
         es_lr: f64,
+        /// Stop training when evader score does not improve for this many consecutive generations.
+        #[arg(long)]
+        patience: Option<usize>,
+        /// Grow nodes/population after this many consecutive stagnant generations.
+        #[arg(long)]
+        stagnation_grow_after: Option<usize>,
+        /// Node-count increase applied to both min-nodes and max-nodes on each growth event.
+        #[arg(long, default_value_t = 5)]
+        stagnation_node_step: i32,
+        /// Population-size increase applied on each growth event.
+        #[arg(long, default_value_t = 25)]
+        stagnation_population_step: usize,
+        /// Optional cap for adaptively grown node counts.
+        #[arg(long)]
+        stagnation_max_nodes_cap: Option<i32>,
+        /// Optional cap for adaptively grown population size.
+        #[arg(long)]
+        stagnation_population_cap: Option<usize>,
     },
     Evaluate {
         #[arg(long, default_value = "models/self_play_models.json")]
@@ -92,6 +110,12 @@ fn main() -> Result<(), String> {
             static_opponent_sample_count,
             training_mode,
             es_lr,
+            patience,
+            stagnation_grow_after,
+            stagnation_node_step,
+            stagnation_population_step,
+            stagnation_max_nodes_cap,
+            stagnation_population_cap,
         } => {
             let (_models, summary) = train_self_play_models(&TrainingConfig {
                 generations,
@@ -114,14 +138,28 @@ fn main() -> Result<(), String> {
                     _ => TrainingMode::Static,
                 },
                 es_lr,
+                patience,
+                stagnation_grow_after,
+                stagnation_node_step,
+                stagnation_population_step,
+                stagnation_max_nodes_cap,
+                stagnation_population_cap,
             })?;
 
             println!(
-                "Training finished: generations={} seed={} searcher_score={:.2} evader_score={:.2} output_dir={}",
+                "Training finished\n  generations:   {}\n  seed:          {}\n  final searcher:{:>8.2}\n  final evader:  {:>8.2}\n  final escape:  {:>8.2}\n  best evader:   {:>8.2} (generation {})\n  best escape:   {:>8.2}\n  best searcher: {:>8.2} (generation {})\n  stopped early: {}\n  interrupted:   {}\n  output dir:    {}",
                 summary.generations,
                 summary.seed,
                 summary.final_searcher_score,
                 summary.final_evader_score,
+                summary.final_escape_score,
+                summary.best_evader_score,
+                summary.best_generation,
+                summary.best_evader_selection_score,
+                summary.best_searcher_score,
+                summary.best_searcher_generation,
+                summary.stopped_early,
+                summary.interrupted,
                 output_dir.display()
             );
         }
@@ -148,10 +186,13 @@ fn main() -> Result<(), String> {
             );
 
             println!(
-                "Evaluation: episodes={} found_rate={:.3} avg_attempts={:.2} searcher_reward={:.2} evader_reward={:.2}",
+                "Evaluation\n  episodes:      {}\n  found rate:    {:>8.3}\n  budget used:   {:>8.1}%\n  avg attempts:  {:>8.2}/{:>8.2}\n  escape score:  {:>8.2}\n  searcher:      {:>8.2}\n  evader:        {:>8.2}",
                 summary.episodes,
                 summary.found_rate,
+                summary.survival_budget_ratio * 100.0,
                 summary.average_attempts,
+                summary.average_max_attempts,
+                summary.escape_quality_score,
                 summary.average_searcher_reward,
                 summary.average_evader_reward
             );

@@ -36,6 +36,13 @@ pub struct HuntStep {
     pub operation_metrics: OperationMetrics,
 }
 
+#[derive(Clone, Copy)]
+pub enum MissRelocationPolicy<'a> {
+    None,
+    Heuristic,
+    Callback(&'a dyn Fn(&AdaptiveShuffleTree, &[i32]) -> Option<i32>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchStrategy {
     Ascending,
@@ -152,6 +159,37 @@ impl ShellFinder {
         evasion: Option<&dyn Fn(&AdaptiveShuffleTree, &[i32]) -> Option<i32>>,
         max_attempts: Option<usize>,
     ) -> Result<Vec<HuntStep>, String> {
+        if let Some(callback) = evasion {
+            let adapter = |tree: &AdaptiveShuffleTree, guessed_keys: &[i32]| callback(tree, guessed_keys);
+            self.iter_hunt_with_relocation_policy_limited(
+                tree,
+                target,
+                chooser,
+                MissRelocationPolicy::Callback(&adapter),
+                max_attempts,
+                true,
+            )
+        } else {
+            self.iter_hunt_with_relocation_policy_limited(
+                tree,
+                target,
+                chooser,
+                MissRelocationPolicy::Heuristic,
+                max_attempts,
+                true,
+            )
+        }
+    }
+
+    pub fn iter_hunt_with_relocation_policy_limited(
+        &mut self,
+        tree: &mut AdaptiveShuffleTree,
+        target: i32,
+        chooser: &dyn Fn(&AdaptiveShuffleTree, &[i32], &[GuessHistoryEntry]) -> Option<i32>,
+        relocation_policy: MissRelocationPolicy<'_>,
+        max_attempts: Option<usize>,
+        splay_on_hit: bool,
+    ) -> Result<Vec<HuntStep>, String> {
         tree.hide_shell(target)?;
 
         let mut steps = vec![HuntStep {
@@ -181,18 +219,24 @@ impl ShellFinder {
 
             let attempt = guessed_in_order.len() + 1;
             let pre_snapshot = tree.snapshot();
+            let pre_shell_key = tree.shell_key();
             let pre_tree_history = tree.tree_history();
             let pre_guess_history = self.guess_history();
-            let pre_history_keys: Vec<i32> = pre_guess_history.iter().map(|entry| entry.guess).collect();
-            let relocate_to = evasion.map(|f| f(&*tree, &pre_history_keys));
-            let recent_guess_keys: Vec<i32> = pre_history_keys
+            let all_guess_keys: Vec<i32> = guessed_in_order
                 .iter()
                 .copied()
                 .chain(std::iter::once(guess))
                 .collect();
-            let found = match relocate_to {
-                None => tree.guess_shell_with_history(guess, &recent_guess_keys),
-                Some(key) => tree.guess_shell_with_relocator(guess, &recent_guess_keys, key),
+            let found = match relocation_policy {
+                MissRelocationPolicy::None => tree.guess_shell_without_relocation(guess, splay_on_hit),
+                MissRelocationPolicy::Heuristic => {
+                    tree.guess_shell_with_history_and_splay(guess, &all_guess_keys, splay_on_hit)
+                }
+                MissRelocationPolicy::Callback(callback) => tree.guess_shell_after_miss(
+                    guess,
+                    splay_on_hit,
+                    |tree_after_shuffle| callback(tree_after_shuffle, &all_guess_keys),
+                ),
             };
             let operation_metrics = tree.operation_metrics();
             let post_snapshot = tree.snapshot();
@@ -202,7 +246,7 @@ impl ShellFinder {
                 guess: Some(guess),
                 found,
                 tree_snapshot: pre_snapshot,
-                shell_key: tree.shell_key(),
+                shell_key: pre_shell_key,
                 attempt,
                 phase: "search".to_string(),
                 tree_history: pre_tree_history,
@@ -409,13 +453,20 @@ fn collect_evasion_aware(
     let mut nodes = Vec::new();
     collect_snapshot_meta(snapshot, 0, "root".to_string(), &mut nodes);
 
-    let recent_keys: Vec<i32> = guess_history
+    let mut recent_keys: Vec<i32> = already_guessed
         .iter()
-        .map(|entry| entry.guess)
-        .chain(already_guessed.iter().copied())
         .rev()
         .take(ShellFinder::HISTORY_LIMIT.max(3))
+        .copied()
         .collect();
+    if recent_keys.is_empty() {
+        recent_keys = guess_history
+            .iter()
+            .rev()
+            .take(ShellFinder::HISTORY_LIMIT.max(3))
+            .map(|entry| entry.guess)
+            .collect();
+    }
 
     let recent_paths: Vec<String> = recent_keys
         .iter()

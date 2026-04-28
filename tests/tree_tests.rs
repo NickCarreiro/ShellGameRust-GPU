@@ -1,12 +1,13 @@
-use shellgame_rust::tree::AdaptiveShuffleTree;
-use shellgame_rust::visualizer::{
-    build_demo_tree as build_visual_demo_tree, build_steps, estimate_step_delay,
-    extract_window_snapshots, layout_tree, normalize_generation_mode, normalize_playback_mode,
-    normalize_search_mode, normalize_target_mode, resolve_target,
+use shellgame_rust_v2::tree::AdaptiveShuffleTree;
+use shellgame_rust_v2::visualizer::{
+    build_demo_tree as build_visual_demo_tree, build_steps, build_visualizer_steps,
+    estimate_step_delay, extract_window_snapshots, layout_tree, normalize_generation_mode,
+    normalize_playback_mode, normalize_search_mode, normalize_target_mode, resolve_target,
+    VisualizerRunConfig,
 };
-use shellgame_rust::{
+use shellgame_rust_v2::{
     build_demo_tree, derive_candidates, derive_candidates_for_strategy, derive_target, normalize_search_strategy,
-    SearchStrategy, ShellFinder,
+    MissRelocationPolicy, SearchStrategy, ShellFinder,
 };
 use std::path::PathBuf;
 
@@ -54,6 +55,101 @@ fn shell_finder_hunt_finds_shell() {
     assert!(result.found);
     assert_eq!(result.attempts, 1);
     assert_eq!(result.guesses, vec![5]);
+}
+
+#[test]
+fn callback_relocation_happens_after_search_step_snapshot() {
+    let tree_history = temp_file("finder_tree_callback_relocation.json");
+    let finder_history = temp_file("finder_history_callback_relocation.json");
+    let mut tree = build_demo_tree(5, &tree_history);
+    let mut finder = ShellFinder::new(&finder_history);
+
+    let chooser = |_tree: &AdaptiveShuffleTree,
+                   guessed: &[i32],
+                   _history: &[shellgame_rust_v2::shell_finder::GuessHistoryEntry]| {
+        if guessed.is_empty() {
+            Some(2)
+        } else {
+            None
+        }
+    };
+    let relocator = |_tree: &AdaptiveShuffleTree, guessed: &[i32]| {
+        assert_eq!(guessed, &[2]);
+        Some(3)
+    };
+
+    let steps = finder
+        .iter_hunt_with_relocation_policy_limited(
+            &mut tree,
+            1,
+            &chooser,
+            MissRelocationPolicy::Callback(&relocator),
+            Some(1),
+            false,
+        )
+        .unwrap();
+
+    let search = steps.iter().find(|step| step.phase == "search").unwrap();
+    let resolve = steps.iter().find(|step| step.phase == "resolve").unwrap();
+
+    assert!(!search.found);
+    assert_eq!(search.shell_key, Some(1));
+    assert_eq!(resolve.shell_key, Some(3));
+}
+
+#[test]
+fn visualizer_static_shell_does_not_relocate_on_misses() {
+    let (steps, resolved_shell) = build_visualizer_steps(&VisualizerRunConfig {
+        node_count: 7,
+        generation_mode: "balanced".to_string(),
+        shell_behavior_mode: "static".to_string(),
+        shell_target: Some(7),
+        search_controller_mode: "algorithm".to_string(),
+        search_algorithm: "ascending".to_string(),
+        model_bundle_path: "unused.json".to_string(),
+        max_attempts_factor: 2,
+        max_attempts_ratio: None,
+        max_attempts_cap: None,
+    })
+    .unwrap();
+
+    assert_eq!(resolved_shell, 7);
+    let misses: Vec<_> = steps
+        .iter()
+        .filter(|step| step.phase == "resolve" && !step.found)
+        .collect();
+    assert!(!misses.is_empty());
+    assert!(misses.iter().all(|step| step.shell_key == Some(7)));
+    assert!(steps
+        .iter()
+        .any(|step| step.phase == "resolve" && step.found && step.shell_key == Some(7)));
+}
+
+#[test]
+fn visualizer_hit_does_not_splay_found_node() {
+    let (steps, _) = build_visualizer_steps(&VisualizerRunConfig {
+        node_count: 7,
+        generation_mode: "balanced".to_string(),
+        shell_behavior_mode: "static".to_string(),
+        shell_target: Some(4),
+        search_controller_mode: "algorithm".to_string(),
+        search_algorithm: "ascending".to_string(),
+        model_bundle_path: "unused.json".to_string(),
+        max_attempts_factor: 2,
+        max_attempts_ratio: None,
+        max_attempts_cap: None,
+    })
+    .unwrap();
+
+    let found_index = steps
+        .iter()
+        .position(|step| step.phase == "resolve" && step.found)
+        .unwrap();
+    let search = &steps[found_index - 1];
+    let resolve = &steps[found_index];
+
+    assert_eq!(search.phase, "search");
+    assert_eq!(search.tree_snapshot, resolve.tree_snapshot);
 }
 
 #[test]

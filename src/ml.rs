@@ -8,7 +8,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    OnceLock,
+};
+use std::time::Instant;
 
 use crate::tree::NodeSnapshot;
 
@@ -28,7 +32,22 @@ fn candle_device() -> &'static Device {
                     d
                 }
                 Err(e) => {
-                    panic!("[skoll/hati] CUDA init failed ({e}). GPU required by default — use --no-default-features only for an intentional CPU comparison.");
+                    let strict = std::env::var("REQUIRE_CUDA")
+                        .map(|value| {
+                            let norm = value.trim().to_ascii_lowercase();
+                            matches!(norm.as_str(), "1" | "true" | "yes" | "on")
+                        })
+                        .unwrap_or(false);
+                    if strict {
+                        panic!(
+                            "[skoll/hati] CUDA init failed ({e}) and REQUIRE_CUDA is set; refusing CPU fallback."
+                        );
+                    }
+                    eprintln!(
+                        "[skoll/hati] WARNING: CUDA init failed ({e}). Falling back to Candle CPU backend. \
+Set REQUIRE_CUDA=1 to enforce hard failure."
+                    );
+                    Device::Cpu
                 }
             }
         }
@@ -41,14 +60,17 @@ fn candle_device() -> &'static Device {
 }
 
 fn accelerator_description() -> &'static str {
-    #[cfg(feature = "cuda")]
-    {
+    if candle_device().is_cuda() {
         "CUDA enabled: batched MLP inference runs on GPU; tree simulation/evolution still runs on CPU"
-    }
-
-    #[cfg(not(feature = "cuda"))]
-    {
-        "CUDA disabled: batched MLP inference is running on CPU"
+    } else {
+        #[cfg(feature = "cuda")]
+        {
+            "CUDA feature enabled, but runtime CUDA unavailable: using Candle CPU backend"
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            "CUDA disabled: batched MLP inference is running on CPU"
+        }
     }
 }
 
@@ -60,12 +82,90 @@ pub fn training_accelerator_is_cuda() -> bool {
     candle_device().is_cuda()
 }
 
+fn parse_env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|raw| {
+        let value = raw.trim().to_ascii_lowercase();
+        match value.as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        }
+    })
+}
+
+fn parse_env_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+}
+
+fn training_heartbeat_enabled() -> bool {
+    static HEARTBEAT: OnceLock<bool> = OnceLock::new();
+    *HEARTBEAT.get_or_init(|| {
+        if let Some(force) = parse_env_bool("TRAIN_HEARTBEAT") {
+            return force;
+        }
+        !training_accelerator_is_cuda()
+    })
+}
+
+fn should_emit_attempt_heartbeat(attempt: usize, max_attempts: usize, interval: usize) -> bool {
+    attempt == 1 || attempt == max_attempts || attempt % interval.max(1) == 0
+}
+
+static TRAINING_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static TRAINING_INTERRUPT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TRAINING_INTERRUPT_HANDLER: OnceLock<Result<(), String>> = OnceLock::new();
+
+fn install_training_interrupt_handler() -> Result<(), String> {
+    TRAINING_STOP_REQUESTED.store(false, AtomicOrdering::SeqCst);
+    TRAINING_INTERRUPT_COUNT.store(0, AtomicOrdering::SeqCst);
+    TRAINING_INTERRUPT_HANDLER
+        .get_or_init(|| {
+            ctrlc::set_handler(|| {
+                let previous = TRAINING_INTERRUPT_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+                TRAINING_STOP_REQUESTED.store(true, AtomicOrdering::SeqCst);
+                if previous == 0 {
+                    eprintln!(
+                        "\nGraceful stop requested. Training will finish the current generation, save the best model, and exit cleanly."
+                    );
+                } else {
+                    eprintln!(
+                        "\nGraceful stop is already pending. Waiting for the current generation checkpoint boundary."
+                    );
+                }
+            })
+            .map_err(|err| err.to_string())
+        })
+        .clone()
+}
+
+fn training_stop_requested() -> bool {
+    TRAINING_STOP_REQUESTED.load(AtomicOrdering::SeqCst)
+}
+
 // Feature counts
 /// Searcher features: 10 original + 4 strategic features (fraction_guessed,
 /// subtree_unguessed_norm, is_pivot_norm, unguessed_sibling_norm).
 pub const SEARCHER_FEATURE_COUNT: usize = 14;
 /// Evader features: 10 original + subtree_size_norm + cold_subtree_flag + recent_same_depth_norm.
 pub const EVADER_FEATURE_COUNT: usize = 14;
+
+/// Default cap for candidate-node cells fed to one batched GPU MLP call.
+/// The crash log showed an NVIDIA Xid 31 MMU fault after adaptive growth reached
+/// population=100.  Keeping `candidates * rows` bounded avoids very large 3-D
+/// batched matmuls that can poison the CUDA context on this laptop GPU.
+const DEFAULT_GPU_SCORE_BATCH_CELLS: usize = 25_600;
+
+fn gpu_score_batch_rows(candidate_count: usize) -> usize {
+    if let Some(rows) = parse_env_usize("GPU_SCORE_BATCH_ROWS") {
+        return rows;
+    }
+    let cells = parse_env_usize("GPU_SCORE_BATCH_CELLS")
+        .unwrap_or(DEFAULT_GPU_SCORE_BATCH_CELLS);
+    (cells / candidate_count.max(1)).max(1)
+}
 
 // MLP architecture — two hidden layers for both roles.
 pub const EVADER_MLP_HIDDEN1: usize = 1024;
@@ -491,6 +591,40 @@ pub struct SelfPlayModels {
     pub searcher: SearcherMlpModel,
 }
 
+fn write_json_pretty_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
+    let serialized = serde_json::to_string_pretty(value).map_err(|err| err.to_string())?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("invalid checkpoint path: {}", path.display()))?
+        .to_string_lossy();
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()));
+
+    fs::write(&tmp_path, serialized).map_err(|err| err.to_string())?;
+    fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&tmp_path);
+        err.to_string()
+    })
+}
+
+fn write_recovery_checkpoint(
+    output_dir: &Path,
+    models: &SelfPlayModels,
+    best_evader_model: &MlpPolicyModel,
+    best_searcher_model: Option<&SearcherMlpModel>,
+) -> Result<(), String> {
+    write_json_pretty_atomic(&output_dir.join("self_play_models.json"), models)?;
+    write_json_pretty_atomic(&output_dir.join("evader_model.json"), &models.evader)?;
+    write_json_pretty_atomic(&output_dir.join("searcher_model.json"), &models.searcher)?;
+    write_json_pretty_atomic(&output_dir.join("best_evader_model.json"), best_evader_model)?;
+    if let Some(best_searcher_model) = best_searcher_model {
+        write_json_pretty_atomic(
+            &output_dir.join("best_searcher_model.json"),
+            best_searcher_model,
+        )?;
+    }
+    Ok(())
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Training configuration and summaries
 // ──────────────────────────────────────────────────────────────────────────────
@@ -517,6 +651,20 @@ pub struct TrainingConfig {
     pub training_mode: TrainingMode,
     /// Adam learning rate for the OpenAI-ES gradient update (applied after each generation).
     pub es_lr: f64,
+    /// Stop training early when evader score does not improve for this many consecutive
+    /// generations. `None` disables early stopping (train for the full `generations` count).
+    pub patience: Option<usize>,
+    /// Grow the curriculum after this many consecutive generations without evader improvement.
+    /// `None` disables adaptive growth; `Some(0)` is treated as disabled.
+    pub stagnation_grow_after: Option<usize>,
+    /// Node-count increase applied to both min_nodes and max_nodes on each growth event.
+    pub stagnation_node_step: i32,
+    /// Population-size increase applied on each growth event.
+    pub stagnation_population_step: usize,
+    /// Optional upper bound for adaptively grown node counts.
+    pub stagnation_max_nodes_cap: Option<i32>,
+    /// Optional upper bound for adaptively grown population size.
+    pub stagnation_population_cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -530,6 +678,21 @@ pub struct TrainingSummary {
     pub generations: usize,
     pub final_searcher_score: f64,
     pub final_evader_score: f64,
+    pub final_escape_score: f64,
+    /// Best evader score seen across all generations (may differ from final if training overshot).
+    pub best_evader_score: f64,
+    /// Promotion score used to select the best evader. This prioritizes low found-rate,
+    /// then high budget usage, then raw evader reward as a small tie-breaker.
+    pub best_evader_selection_score: f64,
+    /// Generation at which best_evader_score was achieved (0 = before training).
+    pub best_generation: usize,
+    /// True when training ended due to patience exhaustion rather than reaching `generations`.
+    pub stopped_early: bool,
+    /// True when the user requested a graceful stop with Ctrl+C.
+    pub interrupted: bool,
+    /// Best searcher score seen across all generations (CoAgent mode only; 0 otherwise).
+    pub best_searcher_score: f64,
+    pub best_searcher_generation: usize,
     pub seed: u64,
 }
 
@@ -538,6 +701,9 @@ pub struct EvaluationSummary {
     pub episodes: usize,
     pub found_rate: f64,
     pub average_attempts: f64,
+    pub average_max_attempts: f64,
+    pub survival_budget_ratio: f64,
+    pub escape_quality_score: f64,
     pub average_searcher_reward: f64,
     pub average_evader_reward: f64,
 }
@@ -547,14 +713,35 @@ struct GenerationRecord {
     generation: usize,
     searcher_score: f64,
     evader_score: f64,
+    escape_score: f64,
     found_rate: f64,
     avg_attempts: f64,
+    avg_max_attempts: f64,
+    survival_budget_ratio: f64,
     /// CoAgent mode only: evader score when evaluated against the fixed static searchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     static_evader_score: Option<f64>,
+    /// CoAgent mode only: escape-quality score against the fixed static searchers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    static_escape_score: Option<f64>,
     /// CoAgent mode only: found rate when evaluated against the fixed static searchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     static_found_rate: Option<f64>,
+    /// CoAgent mode only: survival-budget ratio against the fixed static searchers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    static_survival_budget_ratio: Option<f64>,
+    /// Std dev of evader fitness across the ES population; near-zero signals gradient collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evader_fitness_std: Option<f64>,
+    /// Std dev of searcher fitness across the ES population (CoAgent mode only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    searcher_fitness_std: Option<f64>,
+    /// Active ES population size for this generation.
+    population_size: usize,
+    /// Active minimum node count for this generation's episode specs.
+    min_nodes: i32,
+    /// Active maximum node count for this generation's episode specs.
+    max_nodes: i32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -1213,6 +1400,41 @@ fn compute_max_attempts(
     max_attempts.max(1)
 }
 
+fn survival_budget_ratio(average_attempts: f64, average_max_attempts: f64) -> f64 {
+    if average_max_attempts <= 0.0 {
+        0.0
+    } else {
+        (average_attempts / average_max_attempts).clamp(0.0, 1.0)
+    }
+}
+
+fn escape_quality_score_from_parts(
+    found_rate: f64,
+    average_attempts: f64,
+    average_max_attempts: f64,
+    average_evader_reward: f64,
+) -> f64 {
+    let escape_rate = (1.0 - found_rate).clamp(0.0, 1.0);
+    let budget_ratio = survival_budget_ratio(average_attempts, average_max_attempts);
+
+    // Promotion score, not episode reward:
+    //   1. escape_rate dominates, because the graph showed long but frequently caught runs;
+    //   2. budget_ratio preserves the "make them spend the whole budget" behavior;
+    //   3. raw reward is only a small tie-breaker for relocation/frontier quality.
+    (escape_rate * 1_000.0) + (budget_ratio * 120.0) + (average_evader_reward * 0.05)
+}
+
+fn robust_evader_selection_score(current: &EvaluationSummary, static_eval: Option<&EvaluationSummary>) -> f64 {
+    const STATIC_ROBUSTNESS_WEIGHT: f64 = 0.35;
+
+    if let Some(static_eval) = static_eval {
+        current.escape_quality_score * (1.0 - STATIC_ROBUSTNESS_WEIGHT)
+            + static_eval.escape_quality_score * STATIC_ROBUSTNESS_WEIGHT
+    } else {
+        current.escape_quality_score
+    }
+}
+
 fn frontier_exposure_from_order(target_key: i32, ordered_keys: &[i32]) -> f64 {
     const IMMEDIATE_WINDOW: usize = 6;
 
@@ -1338,25 +1560,33 @@ fn frontier_exposure_penalty(
 fn searcher_reward(
     found: bool,
     attempts: usize,
+    max_attempts: usize,
     min_dist_to_shell: usize,
     unique_guesses: usize,
     node_count: usize,
 ) -> f64 {
     if found {
-        // Early-find tempo bonus: up to +30 when the shell is found quickly relative
-        // to tree size. Also small bonus for avoiding duplicate guesses.
-        let tempo_bonus = ((node_count as f64) / (attempts as f64).max(1.0)).min(3.0) * 10.0;
+        // Any successful capture must beat any failure. Tempo is still rewarded,
+        // but the searcher should never prefer "almost found" over "found late".
+        let attempt_ratio = attempts as f64 / max_attempts.max(1) as f64;
+        let tempo_bonus = (1.0 - attempt_ratio).clamp(0.0, 1.0) * 70.0;
         let diversity_bonus = 5.0 * (unique_guesses as f64 / (attempts as f64).max(1.0)).min(1.0);
-        120.0 - (attempts as f64 * 8.0) + tempo_bonus + diversity_bonus
+        140.0 + tempo_bonus + diversity_bonus
     } else {
         let nc = node_count.max(1) as f64;
+        // Use an approximate tree diameter so proximity retains signal as trees grow.
+        // Normalizing by node_count made most "failed" episodes look similarly good/bad
+        // on larger trees, reducing selection pressure.
+        let approx_diameter = ((node_count.max(2) as f64).log2().ceil() * 2.0).max(2.0);
 
         // Proximity bonus: 0..40. Best when dist == 1 (one hop from shell).
         let proximity_bonus = if min_dist_to_shell == 0 {
             // Guard: found == true should have been caught above.
             40.0
         } else {
-            40.0 * (1.0 - (min_dist_to_shell as f64 - 1.0) / nc).max(0.0)
+            let dist_from_near = (min_dist_to_shell as f64 - 1.0).max(0.0);
+            let closeness = (1.0 - dist_from_near / approx_diameter).clamp(0.0, 1.0);
+            40.0 * closeness
         };
 
         // Coverage bonus: 0..25. Rewards visiting diverse nodes more strongly.
@@ -1406,7 +1636,10 @@ fn evader_reward(
 
     if found {
         let survival_ratio = attempts as f64 / max_attempts.max(1) as f64;
-        (survival_ratio * 70.0) - 35.0 + early_survival_bonus
+        // The graph showed too many "long but caught" runs. Preserve the gradient
+        // for surviving longer, but make any capture much worse than a full escape.
+        let capture_penalty = 95.0 + ((1.0 - survival_ratio).clamp(0.0, 1.0) * 75.0);
+        (survival_ratio * 70.0) + early_survival_bonus - capture_penalty
             - reloc_penalty - frontier_penalty - root_penalty - immediate_capture_penalty
     } else {
         120.0 + (attempts as f64 * 2.5) + early_survival_bonus
@@ -1475,16 +1708,39 @@ pub fn evaluate_pair_on_specs_mlp_searcher(
 
     let found_count = results.iter().filter(|(found, _, _, _)| *found).count();
     let total_attempts: usize = results.iter().map(|(_, attempts, _, _)| *attempts).sum();
+    let total_max_attempts: usize = episode_specs
+        .iter()
+        .map(|spec| {
+            compute_max_attempts(
+                spec.node_count as usize,
+                max_attempts_factor,
+                max_attempts_ratio,
+                max_attempts_cap,
+            )
+        })
+        .sum();
     let total_searcher_reward: f64 = results.iter().map(|(_, _, reward, _)| *reward).sum();
     let total_evader_reward: f64 = results.iter().map(|(_, _, _, reward)| *reward).sum();
 
     let episode_count = episode_specs.len().max(1) as f64;
+    let found_rate = found_count as f64 / episode_count;
+    let average_attempts = total_attempts as f64 / episode_count;
+    let average_max_attempts = total_max_attempts as f64 / episode_count;
+    let average_evader_reward = total_evader_reward / episode_count;
     EvaluationSummary {
         episodes: episode_specs.len().max(1),
-        found_rate: found_count as f64 / episode_count,
-        average_attempts: total_attempts as f64 / episode_count,
+        found_rate,
+        average_attempts,
+        average_max_attempts,
+        survival_budget_ratio: survival_budget_ratio(average_attempts, average_max_attempts),
+        escape_quality_score: escape_quality_score_from_parts(
+            found_rate,
+            average_attempts,
+            average_max_attempts,
+            average_evader_reward,
+        ),
         average_searcher_reward: total_searcher_reward / episode_count,
-        average_evader_reward: total_evader_reward / episode_count,
+        average_evader_reward,
     }
 }
 
@@ -1510,12 +1766,24 @@ fn evaluate_evader_against_fixed_searchers(
         })
         .collect();
     let denom = total.len().max(1) as f64;
+    let found_rate = total.iter().map(|e| e.found_rate).sum::<f64>() / denom;
+    let average_attempts = total.iter().map(|e| e.average_attempts).sum::<f64>() / denom;
+    let average_max_attempts = total.iter().map(|e| e.average_max_attempts).sum::<f64>() / denom;
+    let average_evader_reward = total.iter().map(|e| e.average_evader_reward).sum::<f64>() / denom;
     EvaluationSummary {
         episodes: episode_specs.len().max(1),
-        found_rate: total.iter().map(|e| e.found_rate).sum::<f64>() / denom,
-        average_attempts: total.iter().map(|e| e.average_attempts).sum::<f64>() / denom,
+        found_rate,
+        average_attempts,
+        average_max_attempts,
+        survival_budget_ratio: survival_budget_ratio(average_attempts, average_max_attempts),
+        escape_quality_score: escape_quality_score_from_parts(
+            found_rate,
+            average_attempts,
+            average_max_attempts,
+            average_evader_reward,
+        ),
         average_searcher_reward: total.iter().map(|e| e.average_searcher_reward).sum::<f64>() / denom,
-        average_evader_reward: total.iter().map(|e| e.average_evader_reward).sum::<f64>() / denom,
+        average_evader_reward,
     }
 }
 
@@ -2249,9 +2517,602 @@ fn run_vectorized_episode(
         (
             found,
             attempts,
-            searcher_reward(found, attempts, if found { 0 } else { min_dists[c] }, unique_count, node_count),
+            searcher_reward(
+                found,
+                attempts,
+                max_attempts,
+                if found { 0 } else { min_dists[c] },
+                unique_count,
+                node_count,
+            ),
             evader_reward(found, attempts, max_attempts, reloc_costs[c], frontiers[c], root_relocs[c], node_count),
         )
+    }).collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Memory-bounded GPU scoring helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Like `GpuEvaderBatch::score_all` but splits rows into population-aware chunks
+/// to avoid huge batched CUDA launches on large node counts or combo batches.
+/// Returns `[n_candidates][total_rows]`.
+fn score_all_chunked(
+    gpu_batch: &GpuEvaderBatch,
+    feature_rows: &[f64],
+    input_dim: usize,
+) -> candle_core::Result<Vec<Vec<f64>>> {
+    let total_rows = feature_rows.len() / input_dim.max(1);
+    if total_rows == 0 { return Ok(vec![Vec::new(); gpu_batch.n]); }
+    let max_rows = gpu_score_batch_rows(gpu_batch.n);
+    if total_rows <= max_rows {
+        return gpu_batch.score_all(feature_rows, input_dim);
+    }
+    let n = gpu_batch.n;
+    let mut result: Vec<Vec<f64>> = vec![Vec::with_capacity(total_rows); n];
+    let mut off = 0;
+    while off < total_rows {
+        let end = (off + max_rows).min(total_rows);
+        let chunk = &feature_rows[off * input_dim..end * input_dim];
+        for (c, cs) in gpu_batch.score_all(chunk, input_dim)?.into_iter().enumerate() {
+            result[c].extend(cs);
+        }
+        off = end;
+    }
+    Ok(result)
+}
+
+/// Like `GpuSearcherBatch::score_all_feature_batches` but chunks across the
+/// node dimension to bound peak GPU memory.  Returns `[n_candidates][total_nodes]`.
+fn score_feature_batches_chunked(
+    gpu_batch: &GpuSearcherBatch,
+    feature_rows: &[f64],
+    total_nodes: usize,
+    input_dim: usize,
+) -> candle_core::Result<Vec<Vec<f64>>> {
+    if total_nodes == 0 { return Ok(vec![Vec::new(); gpu_batch.n]); }
+    let max_rows = gpu_score_batch_rows(gpu_batch.n);
+    if total_nodes <= max_rows {
+        return gpu_batch.score_all_feature_batches(feature_rows, total_nodes, input_dim);
+    }
+    let n = gpu_batch.n;
+    let mut result: Vec<Vec<f64>> = vec![Vec::with_capacity(total_nodes); n];
+    let mut node_off = 0;
+    while node_off < total_nodes {
+        let node_end = (node_off + max_rows).min(total_nodes);
+        let chunk_nodes = node_end - node_off;
+        // Interleaved layout: candidate c's chunk is at [c*total_nodes + node_off .. chunk_nodes].
+        let mut chunk_feats = vec![0.0f64; n * chunk_nodes * input_dim];
+        for c in 0..n {
+            let src = c * total_nodes * input_dim + node_off * input_dim;
+            let dst = c * chunk_nodes * input_dim;
+            chunk_feats[dst..dst + chunk_nodes * input_dim]
+                .copy_from_slice(&feature_rows[src..src + chunk_nodes * input_dim]);
+        }
+        for (c, cs) in gpu_batch.score_all_feature_batches(&chunk_feats, chunk_nodes, input_dim)?
+            .into_iter().enumerate()
+        {
+            result[c].extend(cs);
+        }
+        node_off = node_end;
+    }
+    Ok(result)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Step-synchronous batched episode runners
+//
+// These replace the par_iter loops in optimize_evader / optimize_searcher_mlp.
+//
+// Problem with par_iter: N CPU threads each issue tiny GPU calls (M=25 nodes).
+// Those calls serialize on a single CUDA stream, so the GPU sees 1200 sequential
+// tiny matmuls per generation.  Kernel-launch overhead dominates; SM utilisation
+// stays at 30–40%.
+//
+// Fix: process all combos in lockstep.  At each attempt step, concatenate every
+// active combo's node features into one feature matrix and issue ONE GPU call.
+// M grows from 25 → n_combos×25 ≈ 3000, driving SM utilisation to ~80%.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct ComboEvState {
+    tree: FastTrainingTree,
+    s_idx: usize,
+    node_count: usize,
+    max_attempts: usize,
+    min_key: i32,
+    // Per-candidate (n entries):
+    shell_keys: Vec<i32>,
+    alive: Vec<bool>,
+    found_at: Vec<usize>,
+    reloc_costs: Vec<f64>,
+    frontiers: Vec<f64>,
+    root_relocs: Vec<usize>,
+    min_dists: Vec<usize>,
+    // Shared within a combo (one searcher, same guess history for all candidates):
+    recent_guesses: Vec<i32>,
+    unique_guesses: HashSet<i32>,
+    done: bool,
+}
+
+/// Batched evader episode runner.  Returns [combo][candidate] evader rewards.
+fn run_episodes_batched_evader(
+    gpu_batch: &GpuEvaderBatch,
+    gpu_searchers: &[GpuSearcherModel],
+    combos: &[(usize, EpisodeSpec)],
+    max_attempts_factor: usize,
+    max_attempts_ratio: Option<f64>,
+    max_attempts_cap: Option<usize>,
+    phase_label: &str,
+) -> Vec<Vec<f64>> {
+    let n = gpu_batch.n;
+    let n_combos = combos.len();
+    if n_combos == 0 { return Vec::new(); }
+
+    let mut states: Vec<ComboEvState> = combos.iter().map(|&(s_idx, spec)| {
+        let node_count = spec.node_count as usize;
+        let max_attempts = compute_max_attempts(
+            node_count, max_attempts_factor, max_attempts_ratio, max_attempts_cap,
+        );
+        let mut tree = FastTrainingTree::new(spec);
+        let initial_meta = tree.meta_snapshot();
+        let all_keys: Vec<i32> = initial_meta.iter().map(|m| m.key).collect();
+        let min_key = all_keys.iter().copied().min().unwrap_or(1);
+        let fallback = all_keys.get(1).copied().unwrap_or(min_key);
+        let shell_keys = choose_initial_evader_keys_gpu(gpu_batch, n, &initial_meta, fallback);
+        ComboEvState {
+            tree, s_idx, node_count, max_attempts, min_key, shell_keys,
+            alive: vec![true; n],
+            found_at: vec![0usize; n],
+            reloc_costs: vec![0.0; n],
+            frontiers: vec![0.0; n],
+            root_relocs: vec![0usize; n],
+            min_dists: vec![node_count; n],
+            recent_guesses: Vec::new(),
+            unique_guesses: HashSet::new(),
+            done: false,
+        }
+    }).collect();
+
+    let global_max = states.iter().map(|s| s.max_attempts).max().unwrap_or(1);
+    let heartbeat = training_heartbeat_enabled();
+    let heartbeat_interval = (global_max / 4).max(1);
+
+    for attempt in 1..=global_max {
+        let active: Vec<usize> = (0..n_combos).filter(|&i| !states[i].done).collect();
+        if active.is_empty() { break; }
+        if heartbeat && should_emit_attempt_heartbeat(attempt, global_max, heartbeat_interval) {
+            let alive_candidates: usize = active
+                .iter()
+                .map(|&ci| states[ci].alive.iter().filter(|&&alive| alive).count())
+                .sum();
+            println!(
+                "      {:>12} attempt {:>2}/{:<2} | active episodes {:>3}/{:<3} | alive candidates {:>6}",
+                phase_label,
+                attempt,
+                global_max,
+                active.len(),
+                n_combos,
+                alive_candidates
+            );
+            let _ = io::stdout().flush();
+        }
+
+        // ── Phase A: searcher picks a guess for each active combo ──────────
+        // Group by searcher model → one batched GPU call per model.
+        let mut combo_guesses = vec![0i32; n_combos];
+
+        for s_idx in 0..gpu_searchers.len() {
+            let s_combos: Vec<usize> = active.iter().copied()
+                .filter(|&ci| states[ci].s_idx == s_idx)
+                .collect();
+            if s_combos.is_empty() { continue; }
+
+            let mut all_s_feats: Vec<f64> = Vec::new();
+            let mut offsets: Vec<usize> = Vec::new();
+            let mut metas: Vec<Vec<NodeMeta>> = Vec::new();
+            let mut cumul = 0usize;
+
+            for &ci in &s_combos {
+                let st = &mut states[ci];
+                let meta = st.tree.meta_snapshot();
+                for node in &meta {
+                    all_s_feats.extend_from_slice(
+                        &build_searcher_features(node, &meta, &st.recent_guesses),
+                    );
+                }
+                offsets.push(cumul);
+                cumul += meta.len();
+                metas.push(meta);
+            }
+
+            // One GPU call for all combos sharing this searcher.
+            let all_s_scores = gpu_searchers[s_idx].score_nodes(&all_s_feats)
+                .expect("GPU batched searcher scoring failed");
+
+            for (gi, &ci) in s_combos.iter().enumerate() {
+                let st = &states[ci];
+                let meta = &metas[gi];
+                let offset = offsets[gi];
+                let scores = &all_s_scores[offset..offset + meta.len()];
+                let guessed: Vec<i32> = st.unique_guesses.iter().copied().collect();
+                let excluded = if guessed.len() < meta.len() { guessed.clone() } else { vec![] };
+
+                combo_guesses[ci] = meta.iter().zip(scores)
+                    .filter(|(nd, _)| !excluded.contains(&nd.key))
+                    .max_by(|(_, a): &(_, &f64), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                    .or_else(|| meta.iter().zip(scores)
+                        .max_by(|(_, a): &(_, &f64), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal)))
+                    .map(|(nd, _)| nd.key)
+                    .unwrap_or(st.min_key);
+            }
+        }
+
+        // ── Phase B: check found, shuffle tree, update guess history ───────
+        for &ci in &active {
+            let st = &mut states[ci];
+            let guess = combo_guesses[ci];
+            let meta = st.tree.meta_snapshot();
+            let guess_node = meta.iter().find(|m| m.key == guess);
+
+            for c in 0..n {
+                if !st.alive[c] { continue; }
+                if st.shell_keys[c] == guess {
+                    st.alive[c] = false;
+                    st.found_at[c] = attempt;
+                } else if let (Some(gn), Some(sn)) = (
+                    guess_node,
+                    meta.iter().find(|m| m.key == st.shell_keys[c]),
+                ) {
+                    let d = path_distance(gn.path_bits, gn.path_len, sn.path_bits, sn.path_len);
+                    if d < st.min_dists[c] { st.min_dists[c] = d; }
+                }
+            }
+            st.tree.shuffle_step();
+            st.unique_guesses.insert(guess);
+            push_recent_guess(&mut st.recent_guesses, guess);
+            if st.alive.iter().all(|&a| !a) || attempt >= st.max_attempts {
+                st.done = true;
+            }
+        }
+
+        // ── Phase C: evader relocation — one GPU call for all still-active combos ──
+        let still_active: Vec<usize> = (0..n_combos).filter(|&i| !states[i].done).collect();
+        if still_active.is_empty() { break; }
+
+        let mut all_e_feats: Vec<f64> = Vec::new();
+        let mut e_offsets: Vec<usize> = Vec::new();
+        let mut e_ncounts: Vec<usize> = Vec::new();
+        let mut e_metas: Vec<Vec<NodeMeta>> = Vec::new();
+        let mut cumul = 0usize;
+
+        for &ci in &still_active {
+            let st = &mut states[ci];
+            let meta_new = st.tree.meta_snapshot();
+            for node in &meta_new {
+                all_e_feats.extend_from_slice(
+                    &build_evader_features(node, &meta_new, &st.recent_guesses),
+                );
+            }
+            e_offsets.push(cumul);
+            let nn = meta_new.len();
+            e_ncounts.push(nn);
+            cumul += nn;
+            e_metas.push(meta_new);
+        }
+
+        // THE KEY CALL: all combos × all candidates — chunked to bound GPU memory.
+        // M grows from 25 to n_active_combos × avg_nodes; chunks keep activations ≤ ~307 MB.
+        let all_e_scores = score_all_chunked(gpu_batch, &all_e_feats, EVADER_FEATURE_COUNT)
+            .expect("GPU batched evader score_all failed");
+
+        for (gi, &ci) in still_active.iter().enumerate() {
+            let nn = e_ncounts[gi];
+            let offset = e_offsets[gi];
+            let meta_new = &e_metas[gi];
+            let st = &mut states[ci];
+            let guessed_now: Vec<i32> = st.unique_guesses.iter().copied().collect();
+
+            for c in 0..n {
+                if !st.alive[c] { continue; }
+                let scores = &all_e_scores[c][offset..offset + nn];
+                let reloc = meta_new.iter().enumerate()
+                    .filter(|(_, nd)| nd.depth != 0 && !guessed_now.contains(&nd.key))
+                    .max_by(|(i, _), (j, _)| scores[*i].partial_cmp(&scores[*j]).unwrap_or(Ordering::Equal))
+                    .map(|(_, nd)| nd.key)
+                    .or_else(|| meta_new.iter()
+                        .find(|nd| nd.depth != 0 && !guessed_now.contains(&nd.key))
+                        .map(|nd| nd.key));
+                if let Some(rk) = reloc {
+                    st.frontiers[c] += frontier_exposure_penalty(
+                        rk, meta_new, &st.recent_guesses, &guessed_now,
+                    );
+                    if rk == st.min_key { st.root_relocs[c] += 1; }
+                    if let (Some(om), Some(nm)) = (
+                        meta_new.iter().find(|m| m.key == st.shell_keys[c]),
+                        meta_new.iter().find(|m| m.key == rk),
+                    ) {
+                        st.reloc_costs[c] += path_distance(
+                            om.path_bits, om.path_len, nm.path_bits, nm.path_len,
+                        ) as f64;
+                    }
+                    st.shell_keys[c] = rk;
+                }
+            }
+        }
+    }
+
+    states.iter().map(|st| {
+        (0..n).map(|c| {
+            let found = st.found_at[c] > 0;
+            let attempts = if found { st.found_at[c] } else { st.max_attempts };
+            evader_reward(
+                found, attempts, st.max_attempts,
+                st.reloc_costs[c], st.frontiers[c], st.root_relocs[c], st.node_count,
+            )
+        }).collect()
+    }).collect()
+}
+
+struct ComboSrState {
+    tree: FastTrainingTree,
+    e_idx: usize,
+    node_count: usize,
+    max_attempts: usize,
+    min_key: i32,
+    // Per-candidate (n entries) — candidates guess independently so histories diverge:
+    shell_keys: Vec<i32>,
+    alive: Vec<bool>,
+    found_at: Vec<usize>,
+    reloc_costs: Vec<f64>,
+    frontiers: Vec<f64>,
+    root_relocs: Vec<usize>,
+    min_dists: Vec<usize>,
+    recent_guesses: Vec<Vec<i32>>,
+    unique_guesses: Vec<HashSet<i32>>,
+    done: bool,
+}
+
+/// Batched searcher episode runner.  Returns [combo][candidate] searcher rewards.
+fn run_episodes_batched_searcher(
+    gpu_batch: &GpuSearcherBatch,
+    gpu_evaders: &[GpuEvaderModel],
+    combos: &[(usize, EpisodeSpec)],
+    max_attempts_factor: usize,
+    max_attempts_ratio: Option<f64>,
+    max_attempts_cap: Option<usize>,
+    phase_label: &str,
+) -> Vec<Vec<f64>> {
+    let n = gpu_batch.n;
+    let n_combos = combos.len();
+    if n_combos == 0 { return Vec::new(); }
+
+    let mut states: Vec<ComboSrState> = combos.iter().map(|&(e_idx, spec)| {
+        let node_count = spec.node_count as usize;
+        let max_attempts = compute_max_attempts(
+            node_count, max_attempts_factor, max_attempts_ratio, max_attempts_cap,
+        );
+        let mut episode_rng = StdRng::seed_from_u64(spec.seed ^ 0xE0AD_2026);
+        let mut tree = FastTrainingTree::new(spec);
+        let initial_meta = tree.meta_snapshot();
+        let all_keys: Vec<i32> = initial_meta.iter().map(|m| m.key).collect();
+        let min_key = all_keys.iter().copied().min().unwrap_or(1);
+        let initial_shell = sample_key_evader_training_gpu(
+                &gpu_evaders[e_idx], &initial_meta, &[], &[], &mut episode_rng)
+            .or_else(|| choose_key_evader_gpu(&gpu_evaders[e_idx], &initial_meta, &[], &[]))
+            .unwrap_or_else(|| initial_meta.iter().find(|m| m.depth != 0).map(|m| m.key).unwrap_or(2));
+        ComboSrState {
+            tree, e_idx, node_count, max_attempts, min_key,
+            shell_keys: vec![initial_shell; n],
+            alive: vec![true; n],
+            found_at: vec![0usize; n],
+            reloc_costs: vec![0.0; n],
+            frontiers: vec![0.0; n],
+            root_relocs: vec![0usize; n],
+            min_dists: vec![node_count.max(1); n],
+            recent_guesses: vec![Vec::new(); n],
+            unique_guesses: vec![HashSet::new(); n],
+            done: false,
+        }
+    }).collect();
+
+    let global_max = states.iter().map(|s| s.max_attempts).max().unwrap_or(1);
+    let heartbeat = training_heartbeat_enabled();
+    let heartbeat_interval = (global_max / 4).max(1);
+
+    for attempt in 1..=global_max {
+        let active: Vec<usize> = (0..n_combos).filter(|&i| !states[i].done).collect();
+        if active.is_empty() { break; }
+        if heartbeat && should_emit_attempt_heartbeat(attempt, global_max, heartbeat_interval) {
+            let alive_candidates: usize = active
+                .iter()
+                .map(|&ci| states[ci].alive.iter().filter(|&&alive| alive).count())
+                .sum();
+            println!(
+                "      {:>12} attempt {:>2}/{:<2} | active episodes {:>3}/{:<3} | alive candidates {:>6}",
+                phase_label,
+                attempt,
+                global_max,
+                active.len(),
+                n_combos,
+                alive_candidates
+            );
+            let _ = io::stdout().flush();
+        }
+
+        // ── Phase A: all searcher candidates guess — one batched GPU call ──
+        // For all active combos together:
+        //   feature layout per candidate: [combo0_nodes || combo1_nodes || ...]
+        //   total_nodes = Σ n_nodes_active_combos
+        let mut total_nodes = 0usize;
+        let mut combo_offsets: Vec<usize> = Vec::with_capacity(active.len());
+        let mut combo_ncounts: Vec<usize> = Vec::with_capacity(active.len());
+        let mut metas: Vec<Vec<NodeMeta>> = Vec::with_capacity(active.len());
+
+        for &ci in &active {
+            combo_offsets.push(total_nodes);
+            let meta = states[ci].tree.meta_snapshot();
+            combo_ncounts.push(meta.len());
+            total_nodes += meta.len();
+            metas.push(meta);
+        }
+
+        // Build [n × total_nodes × SEARCHER_FEAT] features.
+        let mut all_sr_feats: Vec<f64> = vec![0.0; n * total_nodes * SEARCHER_FEATURE_COUNT];
+        for (gi, &ci) in active.iter().enumerate() {
+            let st = &states[ci];
+            let meta = &metas[gi];
+            let base_node_off = combo_offsets[gi];
+            for c in 0..n {
+                if !st.alive[c] { continue; }
+                let cand_base = c * total_nodes * SEARCHER_FEATURE_COUNT;
+                for (ni, node) in meta.iter().enumerate() {
+                    let feats = build_searcher_features(node, meta, &st.recent_guesses[c]);
+                    let dst = cand_base + (base_node_off + ni) * SEARCHER_FEATURE_COUNT;
+                    all_sr_feats[dst..dst + SEARCHER_FEATURE_COUNT].copy_from_slice(&feats);
+                }
+            }
+        }
+
+        // All candidates × all (batched) nodes — chunked to bound GPU memory.
+        let all_sr_scores = score_feature_batches_chunked(gpu_batch, &all_sr_feats, total_nodes, SEARCHER_FEATURE_COUNT)
+            .expect("GPU batched searcher score_all failed");
+        // all_sr_scores: [n][total_nodes]
+
+        // Pick guess per (combo, candidate) and check found.
+        for (gi, &ci) in active.iter().enumerate() {
+            let st = &mut states[ci];
+            let meta = &metas[gi];
+            let offset = combo_offsets[gi];
+            let nn = combo_ncounts[gi];
+            let all_keys_local: Vec<i32> = meta.iter().map(|m| m.key).collect();
+
+            let mut guesses = vec![st.min_key; n];
+            for c in 0..n {
+                if !st.alive[c] { continue; }
+                let scores = &all_sr_scores[c][offset..offset + nn];
+                let excluded: Vec<i32> = if st.unique_guesses[c].len() < all_keys_local.len() {
+                    st.unique_guesses[c].iter().copied().collect()
+                } else { Vec::new() };
+                guesses[c] = meta.iter().zip(scores)
+                    .filter(|(nd, _)| !excluded.contains(&nd.key))
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
+                    .or_else(|| meta.iter().zip(scores)
+                        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal)))
+                    .map(|(nd, _)| nd.key)
+                    .unwrap_or(st.min_key);
+            }
+
+            for c in 0..n {
+                if !st.alive[c] { continue; }
+                let guess = guesses[c];
+                if st.shell_keys[c] == guess {
+                    st.alive[c] = false;
+                    st.found_at[c] = attempt;
+                } else if let (Some(gn), Some(sn)) = (
+                    meta.iter().find(|m| m.key == guess),
+                    meta.iter().find(|m| m.key == st.shell_keys[c]),
+                ) {
+                    let d = path_distance(gn.path_bits, gn.path_len, sn.path_bits, sn.path_len);
+                    if d < st.min_dists[c] { st.min_dists[c] = d; }
+                }
+                st.unique_guesses[c].insert(guess);
+                push_recent_guess(&mut st.recent_guesses[c], guess);
+            }
+
+            st.tree.shuffle_step();
+            if st.alive.iter().all(|&a| !a) || attempt >= st.max_attempts {
+                st.done = true;
+            }
+        }
+
+        let still_active: Vec<usize> = (0..n_combos).filter(|&i| !states[i].done).collect();
+        if still_active.is_empty() { break; }
+
+        // ── Phase B: evader relocation — batch by evader model ─────────────
+        for e_idx in 0..gpu_evaders.len() {
+            let e_combos: Vec<usize> = still_active.iter().copied()
+                .filter(|&ci| states[ci].e_idx == e_idx)
+                .collect();
+            if e_combos.is_empty() { continue; }
+
+            // Build flat feature rows: [Σ alive_c × n_nodes, EVADER_FEAT].
+            let mut reloc_feats: Vec<f64> = Vec::new();
+            let mut meta_newvec: Vec<Vec<NodeMeta>> = Vec::new();
+
+            for &ci in &e_combos {
+                let st = &mut states[ci];
+                let meta_new = st.tree.meta_snapshot();
+                for c in 0..n {
+                    if !st.alive[c] { continue; }
+                    for node in &meta_new {
+                        reloc_feats.extend_from_slice(
+                            &build_evader_features(node, &meta_new, &st.recent_guesses[c]),
+                        );
+                    }
+                }
+                meta_newvec.push(meta_new);
+            }
+
+            let reloc_scores = gpu_evaders[e_idx]
+                .score_nodes(&reloc_feats)
+                .expect("GPU batched evader relocation failed");
+
+            // Distribute: reconstruct node-level scores per (combo, candidate).
+            let mut row_ptr = 0usize;
+            for (gi, &ci) in e_combos.iter().enumerate() {
+                let st = &mut states[ci];
+                let meta_new = &meta_newvec[gi];
+                let nn = meta_new.len();
+                let guessed_now_per_c: Vec<Vec<i32>> = (0..n)
+                    .map(|c| st.unique_guesses[c].iter().copied().collect())
+                    .collect();
+
+                for c in 0..n {
+                    if !st.alive[c] { continue; }
+                    let scores = &reloc_scores[row_ptr..row_ptr + nn];
+                    row_ptr += nn;
+                    let guessed = &guessed_now_per_c[c];
+                    let relocate_to = meta_new.iter().zip(scores)
+                        .filter(|(nd, _)| nd.depth != 0 && !guessed.contains(&nd.key))
+                        .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap_or(Ordering::Equal))
+                        .map(|(nd, _)| nd.key)
+                        .or_else(|| meta_new.iter().zip(scores)
+                            .filter(|(nd, _)| nd.depth != 0)
+                            .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap_or(Ordering::Equal))
+                            .map(|(nd, _)| nd.key));
+                    if let Some(rk) = relocate_to {
+                        st.frontiers[c] += frontier_exposure_penalty(
+                            rk, meta_new, &st.recent_guesses[c], guessed,
+                        );
+                        if rk == st.min_key { st.root_relocs[c] += 1; }
+                        if let (Some(om), Some(nm)) = (
+                            meta_new.iter().find(|m| m.key == st.shell_keys[c]),
+                            meta_new.iter().find(|m| m.key == rk),
+                        ) {
+                            st.reloc_costs[c] += path_distance(
+                                om.path_bits, om.path_len, nm.path_bits, nm.path_len,
+                            ) as f64;
+                        }
+                        st.shell_keys[c] = rk;
+                    }
+                }
+            }
+        }
+    }
+
+    states.iter().map(|st| {
+        let unique_per_c: Vec<usize> = (0..n).map(|c| st.unique_guesses[c].len()).collect();
+        (0..n).map(|c| {
+            let found = st.found_at[c] > 0;
+            let attempts = if found { st.found_at[c] } else { st.max_attempts };
+            searcher_reward(
+                found,
+                attempts,
+                st.max_attempts,
+                if found { 0 } else { st.min_dists[c] },
+                unique_per_c[c], st.node_count,
+            )
+        }).collect()
     }).collect()
 }
 
@@ -2269,16 +3130,12 @@ fn optimize_evader(
 ) -> (MlpPolicyModel, f64) {
     let n = population_size.max(2);
     let device = candle_device();
+    let phase_start = Instant::now();
 
     // Build the perturbed batch AND generate all noise on GPU in one randn kernel.
     let (gpu_batch, noise) = GpuEvaderBatch::new_es(current_model, n, mutation_scale, device)
         .expect("GPU ES evader batch failed — GPU required");
 
-    // MlpPolicyModel stubs needed only for run_vectorized_episode's type signature;
-    // the actual weights are already resident in gpu_batch.
-    let candidate_stubs: Vec<MlpPolicyModel> = (0..n)
-        .map(|_| current_model.clone())
-        .collect();
 
     let gpu_searchers: Vec<GpuSearcherModel> = searcher_pool
         .iter()
@@ -2290,20 +3147,23 @@ fn optimize_evader(
         .enumerate()
         .flat_map(|(idx, _)| episode_specs.iter().map(move |&sp| (idx, sp)))
         .collect();
+    if training_heartbeat_enabled() {
+        println!(
+            "      evader-opt setup\n        population     {:>6}\n        searcher_pool  {:>6}\n        episodes       {:>6}\n        matchups       {:>6}",
+            n,
+            gpu_searchers.len(),
+            episode_specs.len(),
+            combos.len(),
+        );
+        let _ = io::stdout().flush();
+    }
     let n_evals = combos.len().max(1) as f64;
 
-    let per_episode: Vec<Vec<f64>> = combos
-        .par_iter()
-        .map(|(searcher_idx, spec)| {
-            run_vectorized_episode(
-                &gpu_batch, &candidate_stubs, &gpu_searchers[*searcher_idx], *spec,
-                max_attempts_factor, max_attempts_ratio, max_attempts_cap,
-            )
-            .into_iter()
-            .map(|(_, _, _, er)| er)
-            .collect()
-        })
-        .collect();
+    let per_episode: Vec<Vec<f64>> = run_episodes_batched_evader(
+        &gpu_batch, &gpu_searchers, &combos,
+        max_attempts_factor, max_attempts_ratio, max_attempts_cap,
+        "evader-opt",
+    );
 
     let mut total_scores = vec![0.0f64; n];
     for episode_scores in &per_episode {
@@ -2311,7 +3171,8 @@ fn optimize_evader(
             total_scores[c] += s / n_evals;
         }
     }
-    let best_score = total_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean_score = total_scores.iter().sum::<f64>() / n as f64;
+    let fitness_std = (total_scores.iter().map(|&s| (s - mean_score).powi(2)).sum::<f64>() / n as f64).sqrt();
 
     // GPU matmul: grad = (1/Nσ) * r @ noise  —  one kernel, no CPU accumulation loop.
     let ranked = rank_normalize(&total_scores);
@@ -2345,225 +3206,18 @@ fn optimize_evader(
         w3: adam_update_slice(&current_model.w3, gw3, &mut es_state.m_w3, &mut es_state.v_w3, t, es_lr),
         b3: adam_update_scalar(current_model.b3, gb3, &mut es_state.m_b3, &mut es_state.v_b3, t, es_lr),
     };
-
-    (new_model, best_score)
-}
-
-
-
-/// Run one episode with all searcher candidates simultaneously.
-/// The shuffled tree is shared; each candidate keeps its own guesses and shell position.
-fn run_vectorized_searcher_episode(
-    gpu_batch: &GpuSearcherBatch,
-    candidates: &[SearcherMlpModel],
-    gpu_evader: &GpuEvaderModel,
-    spec: EpisodeSpec,
-    max_attempts_factor: usize,
-    max_attempts_ratio: Option<f64>,
-    max_attempts_cap: Option<usize>,
-) -> Vec<(bool, usize, f64, f64)> {
-    let n = candidates.len();
-    let mut episode_rng = StdRng::seed_from_u64(spec.seed ^ 0xE0AD_2026);
-    let mut tree = FastTrainingTree::new(spec);
-    let initial_meta = tree.meta_snapshot();
-    // GPU-based initial shell placement with temperature sampling. Root is always forbidden.
-    let initial_shell = sample_key_evader_training_gpu(gpu_evader, &initial_meta, &[], &[], &mut episode_rng)
-        .or_else(|| choose_key_evader_gpu(gpu_evader, &initial_meta, &[], &[]))
-        .unwrap_or_else(|| initial_meta.iter().find(|m| m.depth != 0).map(|m| m.key).unwrap_or(2));
-    let all_keys: Vec<i32> = initial_meta.iter().map(|m| m.key).collect();
-    let min_key = all_keys.iter().copied().min().unwrap_or(1);
-    let node_count = spec.node_count as usize;
-    let max_attempts = compute_max_attempts(
-        node_count,
-        max_attempts_factor,
-        max_attempts_ratio,
-        max_attempts_cap,
-    );
-
-    let mut shell_keys = vec![initial_shell; n];
-    let mut alive = vec![true; n];
-    let mut found_at = vec![0usize; n];
-    let mut reloc_costs = vec![0.0f64; n];
-    let mut frontiers = vec![0.0f64; n];
-    let mut root_relocs = vec![0usize; n];
-    let mut min_dists = vec![node_count.max(1); n];
-    let mut recent_guesses = vec![Vec::<i32>::new(); n];
-    let mut unique_guesses = vec![HashSet::<i32>::new(); n];
-
-    for attempt in 1..=max_attempts {
-        let meta = tree.meta_snapshot();
-        let n_nodes = meta.len();
-        let mut searcher_features = Vec::with_capacity(n * n_nodes * SEARCHER_FEATURE_COUNT);
-        for c in 0..n {
-            for node in &meta {
-                searcher_features.extend_from_slice(&build_searcher_features(
-                    node,
-                    &meta,
-                    &recent_guesses[c],
-                ));
-            }
-        }
-
-        let all_scores = gpu_batch
-            .score_all_feature_batches(&searcher_features, n_nodes, SEARCHER_FEATURE_COUNT)
-            .expect("GPU searcher score_all failed — GPU required");
-
-        let mut guesses = vec![min_key; n];
-        for c in 0..n {
-            if !alive[c] {
-                continue;
-            }
-
-            let excluded: Vec<i32> = if unique_guesses[c].len() < all_keys.len() {
-                unique_guesses[c].iter().copied().collect()
-            } else {
-                Vec::new()
-            };
-            let scores = &all_scores[c];
-            guesses[c] = meta
-                .iter()
-                .zip(scores.iter())
-                .filter(|(node, _)| !excluded.contains(&node.key))
-                .max_by(|(_, left), (_, right)| left.partial_cmp(right).unwrap_or(Ordering::Equal))
-                .map(|(node, _)| node.key)
-                .or_else(|| {
-                    meta.iter()
-                        .zip(scores.iter())
-                        .max_by(|(_, left), (_, right)| {
-                            left.partial_cmp(right).unwrap_or(Ordering::Equal)
-                        })
-                        .map(|(node, _)| node.key)
-                })
-                .unwrap_or(min_key);
-        }
-
-        for c in 0..n {
-            if !alive[c] {
-                continue;
-            }
-            let guess = guesses[c];
-            if shell_keys[c] == guess {
-                alive[c] = false;
-                found_at[c] = attempt;
-            } else if let (Some(guess_node), Some(shell_node)) = (
-                meta.iter().find(|m| m.key == guess),
-                meta.iter().find(|m| m.key == shell_keys[c]),
-            ) {
-                let d = path_distance(
-                    guess_node.path_bits,
-                    guess_node.path_len,
-                    shell_node.path_bits,
-                    shell_node.path_len,
-                );
-                if d < min_dists[c] {
-                    min_dists[c] = d;
-                }
-            }
-
-            unique_guesses[c].insert(guess);
-        }
-
-        tree.shuffle_step();
-        if alive.iter().all(|&a| !a) || attempt == max_attempts {
-            break;
-        }
-
-        let meta_new = tree.meta_snapshot();
-        let n_new_nodes = meta_new.len();
-
-        // Batch evader relocation for all alive candidates in one GPU call.
-        let alive_indices: Vec<usize> = (0..n).filter(|&c| alive[c]).collect();
-        if !alive_indices.is_empty() {
-            let mut reloc_features =
-                Vec::with_capacity(alive_indices.len() * n_new_nodes * EVADER_FEATURE_COUNT);
-            for &c in &alive_indices {
-                for node in &meta_new {
-                    reloc_features.extend_from_slice(&build_evader_features(
-                        node,
-                        &meta_new,
-                        &recent_guesses[c],
-                    ));
-                }
-            }
-            let all_reloc_scores = gpu_evader
-                .score_nodes(&reloc_features)
-                .expect("GPU evader relocation scoring failed — GPU required");
-
-            for (batch_idx, &c) in alive_indices.iter().enumerate() {
-                let guessed_keys: Vec<i32> = unique_guesses[c].iter().copied().collect();
-                let offset = batch_idx * n_new_nodes;
-                let scores = &all_reloc_scores[offset..offset + n_new_nodes];
-
-                let relocate_to = meta_new
-                    .iter()
-                    .zip(scores.iter())
-                    .filter(|(nd, _)| nd.depth != 0 && !guessed_keys.contains(&nd.key))
-                    .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap_or(Ordering::Equal))
-                    .map(|(nd, _)| nd.key)
-                    .or_else(|| {
-                        meta_new
-                            .iter()
-                            .zip(scores.iter())
-                            .filter(|(nd, _)| nd.depth != 0)
-                            .max_by(|(_, l), (_, r)| l.partial_cmp(r).unwrap_or(Ordering::Equal))
-                            .map(|(nd, _)| nd.key)
-                    });
-
-                if let Some(relocate_key) = relocate_to {
-                    frontiers[c] += frontier_exposure_penalty(
-                        relocate_key,
-                        &meta_new,
-                        &recent_guesses[c],
-                        &guessed_keys,
-                    );
-                    if relocate_key == min_key {
-                        root_relocs[c] += 1;
-                    }
-                    if let (Some(old_node), Some(new_node)) = (
-                        meta_new.iter().find(|m| m.key == shell_keys[c]),
-                        meta_new.iter().find(|m| m.key == relocate_key),
-                    ) {
-                        reloc_costs[c] += path_distance(
-                            old_node.path_bits,
-                            old_node.path_len,
-                            new_node.path_bits,
-                            new_node.path_len,
-                        ) as f64;
-                    }
-                    shell_keys[c] = relocate_key;
-                }
-                push_recent_guess(&mut recent_guesses[c], guesses[c]);
-            }
-        }
+    if training_heartbeat_enabled() {
+        println!(
+            "      evader-opt done   | elapsed {:>7.1}s | fitness_std {:>7.3}",
+            phase_start.elapsed().as_secs_f64(),
+            fitness_std
+        );
+        let _ = io::stdout().flush();
     }
 
-    (0..n)
-        .map(|c| {
-            let found = found_at[c] > 0;
-            let attempts = if found { found_at[c] } else { max_attempts };
-            (
-                found,
-                attempts,
-                searcher_reward(
-                    found,
-                    attempts,
-                    if found { 0 } else { min_dists[c] },
-                    unique_guesses[c].len(),
-                    node_count,
-                ),
-                evader_reward(
-                    found,
-                    attempts,
-                    max_attempts,
-                    reloc_costs[c],
-                    frontiers[c],
-                    root_relocs[c],
-                    node_count,
-                ),
-            )
-        })
-        .collect()
+    (new_model, fitness_std)
 }
+
 
 fn optimize_searcher_mlp(
     current_model: &SearcherMlpModel,
@@ -2579,11 +3233,10 @@ fn optimize_searcher_mlp(
 ) -> (SearcherMlpModel, f64) {
     let n = population_size.max(2);
     let device = candle_device();
+    let phase_start = Instant::now();
 
     let (gpu_batch, noise) = GpuSearcherBatch::new_es(current_model, n, mutation_scale, device)
         .expect("GPU ES searcher batch failed — GPU required");
-
-    let pool_stubs: Vec<SearcherMlpModel> = (0..n).map(|_| current_model.clone()).collect();
 
     let gpu_evader_pool: Vec<GpuEvaderModel> = evader_pool
         .iter()
@@ -2593,20 +3246,23 @@ fn optimize_searcher_mlp(
     let combos: Vec<(usize, EpisodeSpec)> = (0..gpu_evader_pool.len())
         .flat_map(|ei| episode_specs.iter().map(move |&sp| (ei, sp)))
         .collect();
+    if training_heartbeat_enabled() {
+        println!(
+            "      searcher-opt setup\n        population     {:>6}\n        evader_pool    {:>6}\n        episodes       {:>6}\n        matchups       {:>6}",
+            n,
+            gpu_evader_pool.len(),
+            episode_specs.len(),
+            combos.len(),
+        );
+        let _ = io::stdout().flush();
+    }
     let n_evals = combos.len().max(1) as f64;
 
-    let per_episode: Vec<Vec<f64>> = combos
-        .par_iter()
-        .map(|(ei, spec)| {
-            run_vectorized_searcher_episode(
-                &gpu_batch, &pool_stubs, &gpu_evader_pool[*ei], *spec,
-                max_attempts_factor, max_attempts_ratio, max_attempts_cap,
-            )
-            .into_iter()
-            .map(|(_, _, sr, _)| sr)
-            .collect()
-        })
-        .collect();
+    let per_episode: Vec<Vec<f64>> = run_episodes_batched_searcher(
+        &gpu_batch, &gpu_evader_pool, &combos,
+        max_attempts_factor, max_attempts_ratio, max_attempts_cap,
+        "searcher-opt",
+    );
 
     let mut total_scores = vec![0.0f64; n];
     for episode_scores in &per_episode {
@@ -2614,7 +3270,8 @@ fn optimize_searcher_mlp(
             total_scores[c] += s / n_evals;
         }
     }
-    let best_score = total_scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean_score = total_scores.iter().sum::<f64>() / n as f64;
+    let fitness_std = (total_scores.iter().map(|&s| (s - mean_score).powi(2)).sum::<f64>() / n as f64).sqrt();
 
     let ranked = rank_normalize(&total_scores);
     let grad_flat = es_gradient_gpu(&noise, &ranked, n, mutation_scale)
@@ -2646,8 +3303,16 @@ fn optimize_searcher_mlp(
         w3: adam_update_slice(&current_model.w3, gw3, &mut es_state.m_w3, &mut es_state.v_w3, t, es_lr),
         b3: adam_update_scalar(current_model.b3, gb3, &mut es_state.m_b3, &mut es_state.v_b3, t, es_lr),
     };
+    if training_heartbeat_enabled() {
+        println!(
+            "      searcher-opt done | elapsed {:>7.1}s | fitness_std {:>7.3}",
+            phase_start.elapsed().as_secs_f64(),
+            fitness_std
+        );
+        let _ = io::stdout().flush();
+    }
 
-    (new_model, best_score)
+    (new_model, fitness_std)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2656,6 +3321,39 @@ fn optimize_searcher_mlp(
 
 pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels, TrainingSummary), String> {
     fs::create_dir_all(&config.output_dir).map_err(|err| err.to_string())?;
+    if config.population_size == 0 {
+        return Err("population_size must be at least 1".to_string());
+    }
+    if config.max_nodes < config.min_nodes {
+        return Err(format!(
+            "max_nodes ({}) must be >= min_nodes ({})",
+            config.max_nodes, config.min_nodes
+        ));
+    }
+    if config.stagnation_node_step < 0 {
+        return Err("stagnation_node_step must be >= 0".to_string());
+    }
+    if let Err(err) = install_training_interrupt_handler() {
+        eprintln!(
+            "WARNING: could not install graceful Ctrl+C handler ({err}); interrupting may abort immediately."
+        );
+    }
+    if let Some(cap) = config.stagnation_max_nodes_cap {
+        if cap < config.max_nodes {
+            return Err(format!(
+                "stagnation_max_nodes_cap ({cap}) must be >= initial max_nodes ({})",
+                config.max_nodes
+            ));
+        }
+    }
+    if let Some(cap) = config.stagnation_population_cap {
+        if cap < config.population_size {
+            return Err(format!(
+                "stagnation_population_cap ({cap}) must be >= initial population_size ({})",
+                config.population_size
+            ));
+        }
+    }
 
     #[cfg(debug_assertions)]
     {
@@ -2681,11 +3379,17 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
     let mut evader_es  = EsState::for_evader(&models.evader);
     let mut searcher_es = EsState::for_searcher(&models.searcher);
 
+    let mut active_population_size = config.population_size;
+    let mut active_min_nodes = config.min_nodes;
+    let mut active_max_nodes = config.max_nodes;
+    let adaptive_growth_after = config.stagnation_grow_after.filter(|value| *value > 0);
+    let mut adaptive_growth_events = 0usize;
+
     let initial_specs = build_episode_specs(
         config.episodes_per_eval,
         config.seed,
-        config.min_nodes,
-        config.max_nodes,
+        active_min_nodes,
+        active_max_nodes,
     );
     let mut current = match config.training_mode {
         TrainingMode::CoAgent => evaluate_pair_on_specs_mlp_searcher(
@@ -2705,32 +3409,60 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
             config.max_attempts_cap,
         ),
     };
+    let initial_static_eval = if config.training_mode == TrainingMode::CoAgent {
+        Some(evaluate_evader_against_fixed_searchers(
+            &models.evader,
+            &fixed_evader_only_searchers,
+            &initial_specs,
+            config.max_attempts_factor,
+            config.max_attempts_ratio,
+            config.max_attempts_cap,
+        ))
+    } else {
+        None
+    };
+    let initial_evader_selection_score =
+        robust_evader_selection_score(&current, initial_static_eval.as_ref());
 
+    println!("Training configuration");
+    println!("  mode: {}", match config.training_mode {
+        TrainingMode::Static => "static (evader vs fixed search algorithms)",
+        TrainingMode::CoAgent => "coagent (evader vs learned searcher)",
+    });
+    println!("  generations:       {:>6}", config.generations);
+    println!("  population:        {:>6}", active_population_size);
+    println!("  episodes/eval:     {:>6}", config.episodes_per_eval);
+    println!("  nodes:             {:>3}..{:<3}", active_min_nodes, active_max_nodes);
+    println!("  hall of fame:      {:>6}", config.hall_of_fame_size);
+    println!("  seed:              {:>6}", config.seed);
+    println!("  accelerator: {}", accelerator_description());
+    println!("  controls:          Ctrl+C = finish current generation, save best, exit");
+    if training_accelerator_is_cuda() {
+        if let Some(row_override) = parse_env_usize("GPU_SCORE_BATCH_ROWS") {
+            println!(
+                "  gpu batching:      rows={} (explicit GPU_SCORE_BATCH_ROWS; population={})",
+                row_override,
+                active_population_size,
+            );
+        } else {
+            println!(
+                "  gpu batching:      cells={} rows={} (population={})",
+                parse_env_usize("GPU_SCORE_BATCH_CELLS").unwrap_or(DEFAULT_GPU_SCORE_BATCH_CELLS),
+                gpu_score_batch_rows(active_population_size),
+                active_population_size,
+            );
+        }
+    }
     println!(
-        "Starting self-play training: generations={} population={} episodes_per_eval={} nodes={}..{} hall_of_fame={} seed={}",
-        config.generations,
-        config.population_size,
-        config.episodes_per_eval,
-        config.min_nodes,
-        config.max_nodes,
-        config.hall_of_fame_size,
-        config.seed
-    );
-    println!("Accelerator: {}.", accelerator_description());
-    println!(
-        "Evader model: MLP ({}→{}→{}→1 ReLU), {} features. Searcher model: MLP ({}→{}→{}→1 ReLU), {} features.",
+        "  evader model:      MLP ({}→{}→{}→1 ReLU), {} features",
         EVADER_FEATURE_COUNT, EVADER_MLP_HIDDEN1, EVADER_MLP_HIDDEN2, EVADER_FEATURE_COUNT,
+    );
+    println!(
+        "  searcher model:    MLP ({}→{}→{}→1 ReLU), {} features",
         SEARCHER_FEATURE_COUNT, SEARCHER_MLP_HIDDEN1, SEARCHER_MLP_HIDDEN2, SEARCHER_FEATURE_COUNT,
     );
     println!(
-        "Training mode: {}.",
-        match config.training_mode {
-            TrainingMode::Static => "static (evader vs fixed search algorithms)",
-            TrainingMode::CoAgent => "coagent (evader vs learned searcher)",
-        }
-    );
-    println!(
-        "Attempt budget: factor={} ratio={} cap={}",
+        "  attempt budget:    factor={} ratio={} cap={}",
         config.max_attempts_factor,
         config
             .max_attempts_ratio
@@ -2741,54 +3473,94 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string()),
     );
+    if let Some(grow_after) = adaptive_growth_after {
+        println!(
+            "  adaptive growth:   after={} node_step={} population_step={}{}{}",
+            grow_after,
+            config.stagnation_node_step,
+            config.stagnation_population_step,
+            config
+                .stagnation_max_nodes_cap
+                .map(|cap| format!(" node_cap={cap}"))
+                .unwrap_or_default(),
+            config
+                .stagnation_population_cap
+                .map(|cap| format!(" population_cap={cap}"))
+                .unwrap_or_default(),
+        );
+    }
     if config.training_mode == TrainingMode::Static {
         println!(
-            "Static opponents: {}.",
+            "  static opponents:  {}",
             fixed_searcher_role_names(&fixed_evader_only_searchers),
         );
         println!(
-            "Static opponent sampling: {} per generation (from {} total fixed strategies).",
+            "  static sampling:   {} per generation ({} total fixed strategies)",
             config.static_opponent_sample_count.max(1).min(fixed_evader_only_searchers.len().max(1)),
             fixed_evader_only_searchers.len(),
         );
     }
     if let Some(resume_path) = &config.resume_from {
-        println!("Resuming from model bundle: {}", resume_path.display());
+        println!("  resume bundle:     {}", resume_path.display());
     }
     println!(
-        "Searcher: reward shaping (proximity + coverage bonuses) restores gradient signal on collapse."
+        "  searcher reward:   proximity + coverage shaping"
     );
     println!(
-        "Evader reward includes relocation-distance penalty (0.6 per hop / ln(n))."
+        "  evader reward:     relocation penalty 0.6 per hop / ln(n)"
     );
     match config.training_mode {
         TrainingMode::Static => println!(
-            "Initial scores: opponent_searchers={:.2} evader={:.2} found_rate={:.3} avg_attempts={:.2}",
+            "Initial scores\n  searcher:      {:>8.2}\n  evader:        {:>8.2}\n  escape score:  {:>8.2}\n  found rate:    {:>8.3}\n  budget used:   {:>8.1}%\n  avg attempts:  {:>8.2}/{:>8.2}",
             current.average_searcher_reward,
             current.average_evader_reward,
+            current.escape_quality_score,
             current.found_rate,
-            current.average_attempts
+            current.survival_budget_ratio * 100.0,
+            current.average_attempts,
+            current.average_max_attempts,
         ),
         TrainingMode::CoAgent => println!(
-            "Initial scores: searcher={:.2} evader={:.2} found_rate={:.3} avg_attempts={:.2}",
+            "Initial scores\n  learned\n    searcher:    {:>8.2}\n    evader:      {:>8.2}\n    escape score:{:>8.2}\n    found rate:  {:>8.3}\n    budget used: {:>8.1}%\n    avg attempts:{:>8.2}/{:>8.2}\n  static check\n    evader:      {:>8.2}\n    escape score:{:>8.2}\n    found rate:  {:>8.3}\n    budget used: {:>8.1}%\n  promotion score:{:>7.2}",
             current.average_searcher_reward,
             current.average_evader_reward,
+            current.escape_quality_score,
             current.found_rate,
-            current.average_attempts
+            current.survival_budget_ratio * 100.0,
+            current.average_attempts,
+            current.average_max_attempts,
+            initial_static_eval.as_ref().map(|e| e.average_evader_reward).unwrap_or(0.0),
+            initial_static_eval.as_ref().map(|e| e.escape_quality_score).unwrap_or(0.0),
+            initial_static_eval.as_ref().map(|e| e.found_rate).unwrap_or(0.0),
+            initial_static_eval.as_ref().map(|e| e.survival_budget_ratio * 100.0).unwrap_or(0.0),
+            initial_evader_selection_score,
         ),
     }
     let _ = io::stdout().flush();
 
     let history_path = config.output_dir.join("training_history.json");
+    let bundle_path = config.output_dir.join("self_play_models.json");
+    let best_evader_path = config.output_dir.join("best_evader_model.json");
+    let best_searcher_path = config.output_dir.join("best_searcher_model.json");
     let mut history: Vec<GenerationRecord> = Vec::new();
     history.push(GenerationRecord {
         generation: 0,
         searcher_score: current.average_searcher_reward,
         evader_score: current.average_evader_reward,
+        escape_score: current.escape_quality_score,
         found_rate: current.found_rate,
         avg_attempts: current.average_attempts,
-        static_evader_score: None,
-        static_found_rate: None,
+        avg_max_attempts: current.average_max_attempts,
+        survival_budget_ratio: current.survival_budget_ratio,
+        static_evader_score: initial_static_eval.as_ref().map(|e| e.average_evader_reward),
+        static_escape_score: initial_static_eval.as_ref().map(|e| e.escape_quality_score),
+        static_found_rate: initial_static_eval.as_ref().map(|e| e.found_rate),
+        static_survival_budget_ratio: initial_static_eval.as_ref().map(|e| e.survival_budget_ratio),
+        evader_fitness_std: None,
+        searcher_fitness_std: None,
+        population_size: active_population_size,
+        min_nodes: active_min_nodes,
+        max_nodes: active_max_nodes,
     });
 
     let hall_size = config.hall_of_fame_size;
@@ -2796,13 +3568,111 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
     let mut evader_hall: Vec<MlpPolicyModel> = Vec::new();
     let mut searcher_hall: Vec<SearcherMlpModel> = Vec::new();
 
+    // Best-model tracking state.
+    let mut best_evader_score = current.average_evader_reward;
+    let mut best_evader_selection_score = initial_evader_selection_score;
+    let mut best_evader_model = models.evader.clone();
+    let mut best_generation = 0usize;
+    let mut no_improve_count = 0usize;
+    let mut stopped_early = false;
+    let mut interrupted = false;
+
+    let mut best_searcher_score = current.average_searcher_reward;
+    let mut best_searcher_model = models.searcher.clone();
+    let mut best_searcher_generation = 0usize;
+    write_json_pretty_atomic(&history_path, &history)?;
+    write_recovery_checkpoint(
+        &config.output_dir,
+        &models,
+        &best_evader_model,
+        (config.training_mode == TrainingMode::CoAgent).then_some(&best_searcher_model),
+    )?;
+    println!(
+        "Recovery checkpoint\n  initialized: {}\n  safe resume: generation 0",
+        bundle_path.display()
+    );
+    let _ = io::stdout().flush();
+
     for generation in 0..config.generations {
+        if training_stop_requested() {
+            println!(
+                "Graceful stop\n  generation: before {}/{}\n  action: saving current best model and ending training",
+                generation + 1,
+                config.generations
+            );
+            interrupted = true;
+            break;
+        }
+
+        if let Some(grow_after) = adaptive_growth_after {
+            if no_improve_count > 0 && no_improve_count % grow_after == 0 {
+                let old_min_nodes = active_min_nodes;
+                let old_max_nodes = active_max_nodes;
+                let old_population_size = active_population_size;
+
+                let next_min_nodes = active_min_nodes
+                    .saturating_add(config.stagnation_node_step)
+                    .min(config.stagnation_max_nodes_cap.unwrap_or(i32::MAX));
+                let next_max_nodes = active_max_nodes
+                    .saturating_add(config.stagnation_node_step)
+                    .min(config.stagnation_max_nodes_cap.unwrap_or(i32::MAX))
+                    .max(next_min_nodes);
+                let next_population_size = active_population_size
+                    .saturating_add(config.stagnation_population_step)
+                    .min(config.stagnation_population_cap.unwrap_or(usize::MAX));
+
+                active_min_nodes = next_min_nodes;
+                active_max_nodes = next_max_nodes;
+                active_population_size = next_population_size;
+
+                if active_min_nodes != old_min_nodes
+                    || active_max_nodes != old_max_nodes
+                    || active_population_size != old_population_size
+                {
+                    adaptive_growth_events += 1;
+                    println!(
+                        "Adaptive growth #{}\n  stagnant generations: {}\n  population:           {} -> {}\n  nodes:                {}..{} -> {}..{}",
+                        adaptive_growth_events,
+                        no_improve_count,
+                        old_population_size,
+                        active_population_size,
+                        old_min_nodes,
+                        old_max_nodes,
+                        active_min_nodes,
+                        active_max_nodes
+                    );
+                } else {
+                    println!(
+                        "Adaptive growth skipped\n  stagnant generations: {}\n  reason: already at configured caps",
+                        no_improve_count
+                    );
+                }
+                let _ = io::stdout().flush();
+            }
+        }
+
+        let generation_start = Instant::now();
         let generation_seed = config.seed ^ generation as u64 ^ 0xA11CE;
+        println!(
+            "\nGeneration {}/{}\n  seed:       {}\n  heartbeat:  {}\n  population: {}\n  nodes:      {}..{}",
+            generation + 1,
+            config.generations,
+            generation_seed,
+            if training_heartbeat_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            active_population_size,
+            active_min_nodes,
+            active_max_nodes,
+        );
+        let _ = io::stdout().flush();
         let episode_specs = build_episode_specs(
             config.episodes_per_eval,
             generation_seed,
-            config.min_nodes,
-            config.max_nodes,
+            active_min_nodes,
+            active_max_nodes,
         );
 
         // Snapshot current models into the hall of fame at regular intervals.
@@ -2815,7 +3685,7 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
             if searcher_hall.len() > hall_size { searcher_hall.remove(0); }
         }
 
-        // Build opponent pools: current opponent + a random sample from the hall.
+        // Build opponent pools: current model + hall sample + best-known model.
         let sample = config.hall_sample_count;
         let mut pool_rng = StdRng::seed_from_u64(generation_seed ^ 0xC0FFEE);
 
@@ -2827,8 +3697,13 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
                 evader_pool.push(evader_hall[i].clone());
             }
         }
+        // Always include the all-time-best evader so the searcher always trains against the
+        // hardest opponent it has ever faced, dampening cyclic arms-race regressions.
+        if generation > 0 {
+            evader_pool.push(best_evader_model.clone());
+        }
 
-        let searcher_pool: Vec<SearcherMlpModel> = match config.training_mode {
+        let mut searcher_pool: Vec<SearcherMlpModel> = match config.training_mode {
             TrainingMode::CoAgent => {
                 let mut pool: Vec<SearcherMlpModel> = vec![models.searcher.clone()];
                 if !searcher_hall.is_empty() && sample > 0 {
@@ -2849,37 +3724,70 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
                 &mut pool_rng,
             ),
         };
+        // Mirror: always include the all-time-best searcher so the evader can't exploit regressions.
+        if generation > 0 && config.training_mode == TrainingMode::CoAgent {
+            searcher_pool.push(best_searcher_model.clone());
+        }
 
-        let (best_evader, _evader_score) = optimize_evader(
+        let evader_phase_start = Instant::now();
+        println!(
+            "  phase 1/{}: optimize evader",
+            if config.training_mode == TrainingMode::CoAgent { 4 } else { 2 }
+        );
+        let _ = io::stdout().flush();
+        let (best_evader, evader_fitness_std) = optimize_evader(
             &models.evader,
             &mut evader_es,
             config.es_lr,
             &searcher_pool,
-            config.population_size,
+            active_population_size,
             config.mutation_scale,
             &episode_specs,
             config.max_attempts_factor,
             config.max_attempts_ratio,
             config.max_attempts_cap,
         );
+        println!(
+            "  phase 1 complete | elapsed {:>7.1}s",
+            evader_phase_start.elapsed().as_secs_f64()
+        );
+        let _ = io::stdout().flush();
         models.evader = best_evader;
 
-        if config.training_mode == TrainingMode::CoAgent {
-            let (best_searcher, _searcher_score) = optimize_searcher_mlp(
+        let searcher_fitness_std: Option<f64> = if config.training_mode == TrainingMode::CoAgent {
+            let searcher_phase_start = Instant::now();
+            println!("  phase 2/4: optimize searcher");
+            let _ = io::stdout().flush();
+            let (best_searcher, s_std) = optimize_searcher_mlp(
                 &models.searcher,
                 &mut searcher_es,
                 config.es_lr,
                 &evader_pool,
-                config.population_size,
+                active_population_size,
                 config.mutation_scale,
                 &episode_specs,
                 config.max_attempts_factor,
                 config.max_attempts_ratio,
                 config.max_attempts_cap,
             );
+            println!(
+                "  phase 2 complete | elapsed {:>7.1}s",
+                searcher_phase_start.elapsed().as_secs_f64()
+            );
+            let _ = io::stdout().flush();
             models.searcher = best_searcher;
-        }
+            Some(s_std)
+        } else {
+            None
+        };
 
+        let eval_phase_start = Instant::now();
+        println!(
+            "  phase {}/{}: evaluate learned matchup",
+            if config.training_mode == TrainingMode::CoAgent { 3 } else { 2 },
+            if config.training_mode == TrainingMode::CoAgent { 4 } else { 2 }
+        );
+        let _ = io::stdout().flush();
         current = match config.training_mode {
             TrainingMode::CoAgent => evaluate_pair_on_specs_mlp_searcher(
                 &models.evader,
@@ -2898,40 +3806,115 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
                 config.max_attempts_cap,
             ),
         };
+        println!(
+            "  phase {} complete | elapsed {:>7.1}s",
+            if config.training_mode == TrainingMode::CoAgent { 3 } else { 2 },
+            eval_phase_start.elapsed().as_secs_f64()
+        );
+        let _ = io::stdout().flush();
 
         // In coagent mode, also evaluate against static searchers to track hybrid performance.
         let static_eval = if config.training_mode == TrainingMode::CoAgent {
-            Some(evaluate_evader_against_fixed_searchers(
+            let static_eval_start = Instant::now();
+            println!("  phase 4/4: evaluate vs static searchers");
+            let _ = io::stdout().flush();
+            let result = evaluate_evader_against_fixed_searchers(
                 &models.evader,
                 &fixed_evader_only_searchers,
                 &episode_specs,
                 config.max_attempts_factor,
                 config.max_attempts_ratio,
                 config.max_attempts_cap,
-            ))
+            );
+            println!(
+                "  phase 4 complete | elapsed {:>7.1}s",
+                static_eval_start.elapsed().as_secs_f64()
+            );
+            let _ = io::stdout().flush();
+            Some(result)
         } else {
             None
         };
 
+        // Best-model tracking: optimize for robust escaping, not raw reward alone.
+        // This is the main pressure from the visualizer finding: long escapes are good,
+        // but a model that still gets caught often should not be promoted over a lower-found-rate model.
+        let evader_selection_score =
+            robust_evader_selection_score(&current, static_eval.as_ref());
+        let is_new_best = evader_selection_score > best_evader_selection_score;
+        if is_new_best {
+            best_evader_score = current.average_evader_reward;
+            best_evader_selection_score = evader_selection_score;
+            best_evader_model = models.evader.clone();
+            best_generation = generation + 1;
+            no_improve_count = 0;
+            let _ = write_json_pretty_atomic(&best_evader_path, &best_evader_model);
+            // Snapshot to hall immediately so this peak model is available as an opponent.
+            if hall_size > 0 {
+                evader_hall.push(models.evader.clone());
+                if evader_hall.len() > hall_size { evader_hall.remove(0); }
+            }
+        } else {
+            no_improve_count += 1;
+        }
+
+        // Symmetric best tracking for the searcher (CoAgent only).
+        if config.training_mode == TrainingMode::CoAgent
+            && current.average_searcher_reward > best_searcher_score
+        {
+            best_searcher_score = current.average_searcher_reward;
+            best_searcher_model = models.searcher.clone();
+            best_searcher_generation = generation + 1;
+            let _ = write_json_pretty_atomic(&best_searcher_path, &best_searcher_model);
+            if hall_size > 0 {
+                searcher_hall.push(models.searcher.clone());
+                if searcher_hall.len() > hall_size { searcher_hall.remove(0); }
+            }
+        }
+
+        let collapse_warning = evader_fitness_std < 0.1;
+        let status = match (is_new_best, collapse_warning) {
+            (true, true) => "best, collapse risk: low fitness variance",
+            (true, false) => "best",
+            (false, true) => "collapse risk: low fitness variance",
+            (false, false) => "ok",
+        };
+
         match config.training_mode {
             TrainingMode::Static => println!(
-                "Generation {}/{}: opponent_searchers={:.2} evader={:.2} found_rate={:.3} avg_attempts={:.2}",
-                generation + 1,
-                config.generations,
+                "  summary\n    elapsed:       {:>8.1}s\n    searcher:      {:>8.2}\n    evader:        {:>8.2}\n    escape score:  {:>8.2}\n    found rate:    {:>8.3}\n    budget used:   {:>8.1}%\n    avg attempts:  {:>8.2}/{:>8.2}\n    fitness std:   {:>8.3}\n    status:        {}",
+                generation_start.elapsed().as_secs_f64(),
                 current.average_searcher_reward,
                 current.average_evader_reward,
+                current.escape_quality_score,
                 current.found_rate,
-                current.average_attempts
+                current.survival_budget_ratio * 100.0,
+                current.average_attempts,
+                current.average_max_attempts,
+                evader_fitness_std,
+                status,
             ),
             TrainingMode::CoAgent => println!(
-                "Generation {}/{}: ml_searcher={:.2} evader={:.2} found_rate={:.3} static_evader={:.2} static_found={:.3}",
-                generation + 1,
-                config.generations,
+                "  summary\n    elapsed:       {:>8.1}s\n    learned\n      searcher:    {:>8.2}\n      evader:      {:>8.2}\n      escape score:{:>8.2}\n      found rate:  {:>8.3}\n      budget used: {:>8.1}%\n      avg attempts:{:>8.2}/{:>8.2}\n    static check\n      evader:      {:>8.2}\n      escape score:{:>8.2}\n      found rate:  {:>8.3}\n      budget used: {:>8.1}%\n      avg attempts:{:>8.2}/{:>8.2}\n    promotion\n      score:       {:>8.2}\n      best score:  {:>8.2}\n    fitness\n      evader std:  {:>8.3}\n      searcher std:{:>8.3}\n    status:        {}",
+                generation_start.elapsed().as_secs_f64(),
                 current.average_searcher_reward,
                 current.average_evader_reward,
+                current.escape_quality_score,
                 current.found_rate,
+                current.survival_budget_ratio * 100.0,
+                current.average_attempts,
+                current.average_max_attempts,
                 static_eval.as_ref().map(|e| e.average_evader_reward).unwrap_or(0.0),
+                static_eval.as_ref().map(|e| e.escape_quality_score).unwrap_or(0.0),
                 static_eval.as_ref().map(|e| e.found_rate).unwrap_or(0.0),
+                static_eval.as_ref().map(|e| e.survival_budget_ratio * 100.0).unwrap_or(0.0),
+                static_eval.as_ref().map(|e| e.average_attempts).unwrap_or(0.0),
+                static_eval.as_ref().map(|e| e.average_max_attempts).unwrap_or(0.0),
+                evader_selection_score,
+                best_evader_selection_score,
+                evader_fitness_std,
+                searcher_fitness_std.unwrap_or(0.0),
+                status,
             ),
         }
         let _ = io::stdout().flush();
@@ -2940,31 +3923,98 @@ pub fn train_self_play_models(config: &TrainingConfig) -> Result<(SelfPlayModels
             generation: generation + 1,
             searcher_score: current.average_searcher_reward,
             evader_score: current.average_evader_reward,
+            escape_score: current.escape_quality_score,
             found_rate: current.found_rate,
             avg_attempts: current.average_attempts,
+            avg_max_attempts: current.average_max_attempts,
+            survival_budget_ratio: current.survival_budget_ratio,
             static_evader_score: static_eval.as_ref().map(|e| e.average_evader_reward),
+            static_escape_score: static_eval.as_ref().map(|e| e.escape_quality_score),
             static_found_rate: static_eval.as_ref().map(|e| e.found_rate),
+            static_survival_budget_ratio: static_eval.as_ref().map(|e| e.survival_budget_ratio),
+            evader_fitness_std: Some(evader_fitness_std),
+            searcher_fitness_std,
+            population_size: active_population_size,
+            min_nodes: active_min_nodes,
+            max_nodes: active_max_nodes,
         });
-        if let Ok(json) = serde_json::to_string_pretty(&history) {
-            let _ = fs::write(&history_path, json);
+        write_json_pretty_atomic(&history_path, &history)?;
+        write_recovery_checkpoint(
+            &config.output_dir,
+            &models,
+            &best_evader_model,
+            (config.training_mode == TrainingMode::CoAgent).then_some(&best_searcher_model),
+        )?;
+        println!(
+            "  checkpoint: saved after generation {}",
+            generation + 1
+        );
+        let _ = io::stdout().flush();
+
+        if training_stop_requested() {
+            println!(
+                "Graceful stop\n  generation: {}/{}\n  action: saved checkpoint and ending training with best model intact",
+                generation + 1,
+                config.generations
+            );
+            interrupted = true;
+            break;
+        }
+
+        // Early stopping: bail out if evader has not improved for `patience` generations.
+        if let Some(patience) = config.patience {
+            if no_improve_count >= patience {
+                println!(
+                    "Early stopping\n  generation: {}/{}\n  reason: escape quality stalled for {} generations\n  best evader: {:.2} at generation {}\n  best escape score: {:.2}",
+                    generation + 1,
+                    config.generations,
+                    patience,
+                    best_evader_score,
+                    best_generation,
+                    best_evader_selection_score,
+                );
+                stopped_early = true;
+                break;
+            }
         }
     }
 
-    let bundle_path = config.output_dir.join("self_play_models.json");
-    let searcher_path = config.output_dir.join("searcher_model.json");
-    let evader_path = config.output_dir.join("evader_model.json");
+    write_recovery_checkpoint(
+        &config.output_dir,
+        &models,
+        &best_evader_model,
+        (config.training_mode == TrainingMode::CoAgent).then_some(&best_searcher_model),
+    )?;
 
-    let serialized_bundle = serde_json::to_string_pretty(&models).map_err(|err| err.to_string())?;
-    fs::write(bundle_path, serialized_bundle).map_err(|err| err.to_string())?;
-    models.searcher.save_json(searcher_path)?;
-    models.evader.save_json(evader_path)?;
+    println!(
+        "Best evader\n  evader score:  {:.2}\n  escape score:  {:.2}\n  generation:    {}\n  saved:         {}",
+        best_evader_score,
+        best_evader_selection_score,
+        best_generation,
+        best_evader_path.display()
+    );
+    if config.training_mode == TrainingMode::CoAgent {
+        println!(
+            "Best searcher\n  score:      {:.2}\n  generation: {}\n  saved:      {}",
+            best_searcher_score, best_searcher_generation, best_searcher_path.display()
+        );
+    }
 
+    let actual_generations = history.len().saturating_sub(1);
     Ok((
         models,
         TrainingSummary {
-            generations: config.generations,
+            generations: actual_generations,
             final_searcher_score: current.average_searcher_reward,
             final_evader_score: current.average_evader_reward,
+            final_escape_score: current.escape_quality_score,
+            best_evader_score,
+            best_evader_selection_score,
+            best_generation,
+            stopped_early,
+            interrupted,
+            best_searcher_score,
+            best_searcher_generation,
             seed: config.seed,
         },
     ))

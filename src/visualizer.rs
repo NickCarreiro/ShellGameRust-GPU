@@ -1,5 +1,6 @@
 use crate::shell_finder::{
-    derive_candidates_for_strategy, derive_target, normalize_search_strategy, HuntStep, ShellFinder,
+    derive_candidates_for_strategy, derive_target, normalize_search_strategy, HuntStep,
+    MissRelocationPolicy, ShellFinder,
 };
 use crate::ml::{
     choose_evader_relocation_from_snapshot, choose_searcher_guess_from_snapshot, load_model_bundle,
@@ -9,9 +10,11 @@ use crate::tree::{AdaptiveShuffleTree, NodeSnapshot, TreeNode};
 use eframe::egui;
 use rand::seq::SliceRandom;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -372,30 +375,177 @@ pub struct VisualizerRunConfig {
     pub max_attempts_cap: Option<usize>,
 }
 
-fn recent_guess_window(guess_history: &[crate::shell_finder::GuessHistoryEntry], already_guessed: &[i32]) -> Vec<i32> {
-    let mut combined: Vec<i32> = guess_history
-        .iter()
-        .map(|entry| entry.guess)
-        .chain(already_guessed.iter().copied())
-        .collect();
-    if combined.len() > VISUALIZER_RECENT_MEMORY {
-        let start = combined.len() - VISUALIZER_RECENT_MEMORY;
-        combined = combined[start..].to_vec();
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VisualizerPreset {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    pub node_count: i32,
+    pub generation_mode: String,
+    pub shell_behavior_mode: String,
+    #[serde(default)]
+    pub shell_target: Option<i32>,
+    pub search_controller_mode: String,
+    pub search_algorithm: String,
+    /// Use "$CURRENT_MODEL" or an empty string to preserve the model currently loaded in the UI.
+    #[serde(default)]
+    pub model_bundle_path: String,
+    pub max_attempts_factor: usize,
+    #[serde(default)]
+    pub max_attempts_ratio: Option<f64>,
+    #[serde(default)]
+    pub max_attempts_cap: Option<usize>,
+    #[serde(default)]
+    pub reveal_shell: Option<bool>,
+    #[serde(default)]
+    pub auto_rerun: Option<bool>,
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
+}
+
+const VISUALIZER_PRESET_FILE: &str = "visualizer_presets.json";
+const CURRENT_MODEL_PLACEHOLDER: &str = "$CURRENT_MODEL";
+
+fn preset_file_path() -> PathBuf {
+    std::env::var("VISUALIZER_PRESETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(VISUALIZER_PRESET_FILE))
+}
+
+fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset> {
+    let model = CURRENT_MODEL_PLACEHOLDER.to_string();
+
+    vec![
+        VisualizerPreset {
+            name: "Champion Stress".to_string(),
+            description: "Large uneven tree, adaptive shell, trained searcher, capped budget. Mirrors the current high-pressure model-vs-model read.".to_string(),
+            node_count: 115,
+            generation_mode: "uneven".to_string(),
+            shell_behavior_mode: "adaptive".to_string(),
+            shell_target: None,
+            search_controller_mode: "model".to_string(),
+            search_algorithm: "evasion-aware".to_string(),
+            model_bundle_path: model.clone(),
+            max_attempts_factor: 8,
+            max_attempts_ratio: Some(2.0),
+            max_attempts_cap: Some(40),
+            reveal_shell: Some(true),
+            auto_rerun: Some(true),
+            delay_ms: Some(5),
+        },
+        VisualizerPreset {
+            name: "Static Generalization".to_string(),
+            description: "Adaptive shell against the evasion-aware algorithm. Useful for checking whether the evader is robust beyond the learned searcher.".to_string(),
+            node_count: 115,
+            generation_mode: "uneven".to_string(),
+            shell_behavior_mode: "adaptive".to_string(),
+            shell_target: None,
+            search_controller_mode: "algorithm".to_string(),
+            search_algorithm: "evasion-aware".to_string(),
+            model_bundle_path: model.clone(),
+            max_attempts_factor: 8,
+            max_attempts_ratio: Some(2.0),
+            max_attempts_cap: Some(40),
+            reveal_shell: Some(true),
+            auto_rerun: Some(true),
+            delay_ms: Some(5),
+        },
+        VisualizerPreset {
+            name: "Ascending Baseline".to_string(),
+            description: "Adaptive shell against simple ascending search. This catches regressions where the evader forgets easy static opponents.".to_string(),
+            node_count: 115,
+            generation_mode: "uneven".to_string(),
+            shell_behavior_mode: "adaptive".to_string(),
+            shell_target: None,
+            search_controller_mode: "algorithm".to_string(),
+            search_algorithm: "ascending".to_string(),
+            model_bundle_path: model.clone(),
+            max_attempts_factor: 8,
+            max_attempts_ratio: Some(2.0),
+            max_attempts_cap: Some(40),
+            reveal_shell: Some(true),
+            auto_rerun: Some(true),
+            delay_ms: Some(5),
+        },
+        VisualizerPreset {
+            name: "Small Sanity".to_string(),
+            description: "Short, readable model-vs-model run for understanding behavior by eye before scaling up.".to_string(),
+            node_count: 31,
+            generation_mode: "uneven".to_string(),
+            shell_behavior_mode: "adaptive".to_string(),
+            shell_target: None,
+            search_controller_mode: "model".to_string(),
+            search_algorithm: "evasion-aware".to_string(),
+            model_bundle_path: model.clone(),
+            max_attempts_factor: 4,
+            max_attempts_ratio: Some(0.40),
+            max_attempts_cap: None,
+            reveal_shell: Some(true),
+            auto_rerun: Some(false),
+            delay_ms: Some(120),
+        },
+        VisualizerPreset {
+            name: "Static Shell Probe".to_string(),
+            description: "Fixed shell target with trained searcher. Useful for seeing searcher coverage patterns without relocation noise.".to_string(),
+            node_count: 63,
+            generation_mode: "balanced".to_string(),
+            shell_behavior_mode: "static".to_string(),
+            shell_target: Some(48),
+            search_controller_mode: "model".to_string(),
+            search_algorithm: "evasion-aware".to_string(),
+            model_bundle_path: model,
+            max_attempts_factor: 4,
+            max_attempts_ratio: Some(0.40),
+            max_attempts_cap: None,
+            reveal_shell: Some(true),
+            auto_rerun: Some(false),
+            delay_ms: Some(160),
+        },
+    ]
+}
+
+pub fn load_visualizer_presets(current_model_path: &str) -> (Vec<VisualizerPreset>, PathBuf, Option<String>) {
+    let path = preset_file_path();
+    match fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str::<Vec<VisualizerPreset>>(&text) {
+            Ok(presets) if !presets.is_empty() => (presets, path, None),
+            Ok(_) => (
+                default_visualizer_presets(current_model_path),
+                path,
+                Some("Preset file is empty; loaded built-in presets.".to_string()),
+            ),
+            Err(err) => (
+                default_visualizer_presets(current_model_path),
+                path,
+                Some(format!("Could not parse preset file; loaded built-ins instead: {err}")),
+            ),
+        },
+        Err(_) => (default_visualizer_presets(current_model_path), path, None),
     }
-    combined
+}
+
+fn save_visualizer_presets(path: &Path, presets: &[VisualizerPreset]) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(presets).map_err(|err| err.to_string())?;
+    fs::write(path, text).map_err(|err| err.to_string())
+}
+
+fn recent_guess_window(already_guessed: &[i32]) -> Vec<i32> {
+    let mut recent: Vec<i32> = already_guessed.to_vec();
+    if recent.len() > VISUALIZER_RECENT_MEMORY {
+        let start = recent.len() - VISUALIZER_RECENT_MEMORY;
+        recent = recent[start..].to_vec();
+    }
+    recent
 }
 
 fn choose_random_shell_key(tree: &AdaptiveShuffleTree, excluded: &[i32]) -> Option<i32> {
     let mut keys = tree.node_keys();
     keys.sort();
-    let mut candidates: Vec<i32> = keys
+    let candidates: Vec<i32> = keys
         .iter()
         .copied()
         .filter(|key| !excluded.contains(key))
         .collect();
-    if candidates.is_empty() {
-        candidates = keys;
-    }
     let mut rng = rand::thread_rng();
     candidates.choose(&mut rng).copied()
 }
@@ -465,7 +615,7 @@ pub fn build_visualizer_steps(config: &VisualizerRunConfig) -> Result<(Vec<HuntS
             "model" => {
                 let snapshot = tree.snapshot()?;
                 let models = models.as_ref()?;
-                let recent = recent_guess_window(guess_history, guessed_in_order);
+                let recent = recent_guess_window(guessed_in_order);
                 let excluded = if guessed_in_order.len() < tree.node_keys().len() {
                     guessed_in_order.to_vec()
                 } else {
@@ -482,29 +632,34 @@ pub fn build_visualizer_steps(config: &VisualizerRunConfig) -> Result<(Vec<HuntS
         }
     };
 
-    let evasion: Option<&dyn Fn(&AdaptiveShuffleTree, &[i32]) -> Option<i32>> = match shell_behavior_mode {
-        "static" => None,
-        "random" => Some(&|tree, recent_guesses| choose_random_shell_key(tree, recent_guesses)),
-        "adaptive" => Some(&|tree, recent_guesses| {
-            let snapshot = tree.snapshot()?;
-            let models = models.as_ref()?;
-            choose_evader_relocation_from_snapshot(
-                &models.evader,
-                &snapshot,
-                recent_guesses,
-                recent_guesses,
-            )
-                .or_else(|| choose_random_shell_key(tree, recent_guesses))
-        }),
-        _ => None,
+    let random_relocator =
+        |tree: &AdaptiveShuffleTree, guessed_keys: &[i32]| choose_random_shell_key(tree, guessed_keys);
+    let adaptive_relocator = |tree: &AdaptiveShuffleTree, guessed_keys: &[i32]| {
+        let snapshot = tree.snapshot()?;
+        let models = models.as_ref()?;
+        let recent_guesses = recent_guess_window(guessed_keys);
+        choose_evader_relocation_from_snapshot(
+            &models.evader,
+            &snapshot,
+            &recent_guesses,
+            guessed_keys,
+        )
+        .or_else(|| choose_random_shell_key(tree, guessed_keys))
+    };
+    let relocation_policy = match shell_behavior_mode {
+        "static" => MissRelocationPolicy::None,
+        "random" => MissRelocationPolicy::Callback(&random_relocator),
+        "adaptive" => MissRelocationPolicy::Callback(&adaptive_relocator),
+        _ => MissRelocationPolicy::None,
     };
 
-    let steps = finder.iter_hunt_with_callbacks_limited(
+    let steps = finder.iter_hunt_with_relocation_policy_limited(
         &mut tree,
         initial_shell,
         &search_chooser,
-        evasion,
+        relocation_policy,
         Some(max_attempts),
+        false,
     )?;
     Ok((steps, initial_shell))
 }
@@ -640,6 +795,27 @@ fn parse_hex_color(hex: &str) -> egui::Color32 {
     egui::Color32::from_rgb(r, g, b)
 }
 
+#[derive(Debug, Clone)]
+struct VisualizationRunRecord {
+    run: usize,
+    epoch: usize,
+    attempts: usize,
+    max_attempts: usize,
+    found: bool,
+    escape_attempts: f64,
+    survival_ratio: f64,
+    running_escape_avg: f64,
+    running_found_rate: f64,
+    search_work: usize,
+    shuffle_work: usize,
+}
+
+struct ChartSeries {
+    name: &'static str,
+    values: Vec<f64>,
+    color: egui::Color32,
+}
+
 pub struct TreeVisualizerApp {
     pub reveal_shell: bool,
     pub delay_ms: u64,
@@ -662,6 +838,16 @@ pub struct TreeVisualizerApp {
     pub current_step: Option<HuntStep>,
     pub model_bundle_path: String,
     pub status_message: String,
+    pub presets: Vec<VisualizerPreset>,
+    pub selected_preset: usize,
+    pub preset_name_input: String,
+    pub preset_file_path: PathBuf,
+    pub graph_history_limit: usize,
+    graph_history: Vec<VisualizationRunRecord>,
+    active_parameter_signature: String,
+    active_parameter_epoch: usize,
+    active_max_attempts: usize,
+    recorded_current_run: bool,
     last_tick: Instant,
 }
 
@@ -682,7 +868,8 @@ impl TreeVisualizerApp {
         auto_rerun: bool,
         model_bundle_path: String,
     ) -> Self {
-        Self {
+        let (presets, preset_file_path, preset_warning) = load_visualizer_presets(&model_bundle_path);
+        let mut app = Self {
             reveal_shell,
             delay_ms: delay_ms.max(5),
             node_count: initial_node_count.max(1),
@@ -703,12 +890,34 @@ impl TreeVisualizerApp {
             index: 0,
             current_step: None,
             model_bundle_path,
-            status_message: String::new(),
+            status_message: preset_warning.unwrap_or_default(),
+            presets,
+            selected_preset: 0,
+            preset_name_input: "Custom setup".to_string(),
+            preset_file_path,
+            graph_history_limit: 160,
+            graph_history: Vec::new(),
+            active_parameter_signature: String::new(),
+            active_parameter_epoch: 0,
+            active_max_attempts: 1,
+            recorded_current_run: false,
             last_tick: Instant::now(),
-        }
+        };
+        app.active_parameter_signature = app.parameter_signature();
+        app.active_max_attempts = app.effective_max_attempts();
+        app
     }
 
     fn restart(&mut self) {
+        let next_signature = self.parameter_signature();
+        let mut reset_graph_average = false;
+        if next_signature != self.active_parameter_signature {
+            self.active_parameter_epoch += 1;
+            self.active_parameter_signature = next_signature;
+            reset_graph_average = true;
+        }
+        self.active_max_attempts = self.effective_max_attempts();
+
         let config = VisualizerRunConfig {
             node_count: self.node_count,
             generation_mode: self.generation_mode.clone(),
@@ -730,12 +939,213 @@ impl TreeVisualizerApp {
                 self.shell_target = resolved_shell;
                 self.last_tick = Instant::now();
                 self.run_count += 1;
-                self.status_message.clear();
+                self.recorded_current_run = false;
+                self.status_message = if reset_graph_average {
+                    "Graph averages reset because run parameters changed.".to_string()
+                } else {
+                    String::new()
+                };
             }
             Err(err) => {
                 self.status_message = err;
             }
         }
+    }
+
+    fn selected_preset_name(&self) -> String {
+        self.presets
+            .get(self.selected_preset)
+            .map(|preset| preset.name.clone())
+            .unwrap_or_else(|| "No presets".to_string())
+    }
+
+    fn apply_preset(&mut self, preset: &VisualizerPreset) {
+        self.node_count = preset.node_count.max(1);
+        self.generation_mode = normalize_generation_mode(&preset.generation_mode).to_string();
+        self.shell_behavior_mode = normalize_shell_behavior_mode(&preset.shell_behavior_mode).to_string();
+        if let Some(target) = preset.shell_target {
+            self.shell_target = target.max(1);
+        }
+        self.search_controller_mode =
+            normalize_search_controller_mode(&preset.search_controller_mode).to_string();
+        self.search_algorithm = normalize_search_mode(&preset.search_algorithm).to_string();
+        self.max_attempts_factor = preset.max_attempts_factor.max(1);
+        self.max_attempts_ratio = preset.max_attempts_ratio.unwrap_or(self.max_attempts_ratio).max(0.05);
+        self.use_attempt_ratio = preset.max_attempts_ratio.is_some();
+        self.max_attempts_cap = preset.max_attempts_cap.unwrap_or(self.max_attempts_cap).max(1);
+        self.use_attempt_cap = preset.max_attempts_cap.is_some();
+        if let Some(reveal_shell) = preset.reveal_shell {
+            self.reveal_shell = reveal_shell;
+        }
+        if let Some(auto_rerun) = preset.auto_rerun {
+            self.auto_rerun = auto_rerun;
+        }
+        if let Some(delay_ms) = preset.delay_ms {
+            self.delay_ms = delay_ms.max(5);
+        }
+
+        let model_path = preset.model_bundle_path.trim();
+        if !model_path.is_empty() && model_path != CURRENT_MODEL_PLACEHOLDER {
+            self.model_bundle_path = model_path.to_string();
+        }
+
+        let preset_name = preset.name.clone();
+        self.restart();
+        if self.status_message.is_empty() {
+            self.status_message = format!("Loaded preset: {preset_name}");
+        } else if self.status_message.starts_with("Graph averages reset") {
+            self.status_message = format!("Loaded preset: {preset_name}. {}", self.status_message);
+        }
+    }
+
+    fn preset_from_current(&self, name: String) -> VisualizerPreset {
+        VisualizerPreset {
+            name,
+            description: "Saved from the current visualizer controls.".to_string(),
+            node_count: self.node_count.max(1),
+            generation_mode: self.generation_mode.clone(),
+            shell_behavior_mode: self.shell_behavior_mode.clone(),
+            shell_target: (self.shell_behavior_mode == "static").then_some(self.shell_target.max(1)),
+            search_controller_mode: self.search_controller_mode.clone(),
+            search_algorithm: self.search_algorithm.clone(),
+            model_bundle_path: self.model_bundle_path.clone(),
+            max_attempts_factor: self.max_attempts_factor.max(1),
+            max_attempts_ratio: self.use_attempt_ratio.then_some(self.max_attempts_ratio),
+            max_attempts_cap: self.use_attempt_cap.then_some(self.max_attempts_cap),
+            reveal_shell: Some(self.reveal_shell),
+            auto_rerun: Some(self.auto_rerun),
+            delay_ms: Some(self.delay_ms.max(5)),
+        }
+    }
+
+    fn save_current_preset(&mut self) {
+        let name = if self.preset_name_input.trim().is_empty() {
+            format!("Custom setup {}", self.presets.len() + 1)
+        } else {
+            self.preset_name_input.trim().to_string()
+        };
+        let preset = self.preset_from_current(name.clone());
+        if let Some(existing) = self.presets.iter_mut().find(|item| item.name == name) {
+            *existing = preset;
+        } else {
+            self.presets.push(preset);
+            self.selected_preset = self.presets.len().saturating_sub(1);
+        }
+
+        match save_visualizer_presets(&self.preset_file_path, &self.presets) {
+            Ok(()) => {
+                self.status_message = format!(
+                    "Saved preset '{}' to {}",
+                    name,
+                    self.preset_file_path.display()
+                );
+            }
+            Err(err) => {
+                self.status_message = format!("Could not save preset: {err}");
+            }
+        }
+    }
+
+    fn delete_selected_preset(&mut self) {
+        if self.presets.is_empty() {
+            return;
+        }
+        let removed = self.presets.remove(self.selected_preset.min(self.presets.len() - 1));
+        self.selected_preset = self.selected_preset.saturating_sub(1).min(self.presets.len().saturating_sub(1));
+        match save_visualizer_presets(&self.preset_file_path, &self.presets) {
+            Ok(()) => {
+                self.status_message = format!("Deleted preset '{}'.", removed.name);
+            }
+            Err(err) => {
+                self.status_message = format!("Deleted preset locally, but could not save file: {err}");
+            }
+        }
+    }
+
+    fn reload_presets(&mut self) {
+        let (presets, path, warning) = load_visualizer_presets(&self.model_bundle_path);
+        self.presets = presets;
+        self.preset_file_path = path;
+        self.selected_preset = self.selected_preset.min(self.presets.len().saturating_sub(1));
+        self.status_message = warning.unwrap_or_else(|| {
+            format!("Reloaded {} preset(s).", self.presets.len())
+        });
+    }
+
+    fn draw_presets(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Presets")
+            .default_open(true)
+            .show(ui, |ui| {
+            ui.label("Load repeatable visualization setups for model-vs-model, static baselines, and stress tests.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Preset");
+                egui::ComboBox::from_id_salt("visualizer_preset_picker")
+                    .selected_text(self.selected_preset_name())
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for (idx, preset) in self.presets.iter().enumerate() {
+                            ui.selectable_value(&mut self.selected_preset, idx, &preset.name);
+                        }
+                    });
+
+                if ui.button("Apply + Restart").clicked() {
+                    if let Some(preset) = self.presets.get(self.selected_preset).cloned() {
+                        self.apply_preset(&preset);
+                    }
+                }
+                if ui.button("Reload").clicked() {
+                    self.reload_presets();
+                }
+                if ui.button("Delete").clicked() {
+                    self.delete_selected_preset();
+                }
+            });
+
+            if let Some(preset) = self.presets.get(self.selected_preset) {
+                ui.label(format!(
+                    "{} | nodes={} {} | shell={} | search={}{} | budget factor={} ratio={} cap={} | model={}",
+                    preset.name,
+                    preset.node_count,
+                    normalize_generation_mode(&preset.generation_mode),
+                    normalize_shell_behavior_mode(&preset.shell_behavior_mode),
+                    normalize_search_controller_mode(&preset.search_controller_mode),
+                    if normalize_search_controller_mode(&preset.search_controller_mode) == "algorithm" {
+                        format!(":{}", normalize_search_mode(&preset.search_algorithm))
+                    } else {
+                        String::new()
+                    },
+                    preset.max_attempts_factor,
+                    preset
+                        .max_attempts_ratio
+                        .map(|value| format!("{value:.2}"))
+                        .unwrap_or_else(|| "off".to_string()),
+                    preset
+                        .max_attempts_cap
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "off".to_string()),
+                    if preset.model_bundle_path.trim().is_empty()
+                        || preset.model_bundle_path.trim() == CURRENT_MODEL_PLACEHOLDER
+                    {
+                        "current model"
+                    } else {
+                        preset.model_bundle_path.as_str()
+                    },
+                ));
+                if !preset.description.trim().is_empty() {
+                    ui.label(egui::RichText::new(&preset.description).small());
+                }
+            }
+
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Save current as");
+                ui.text_edit_singleline(&mut self.preset_name_input);
+                if ui.button("Save Current").clicked() {
+                    self.save_current_preset();
+                }
+                ui.label(format!("file: {}", self.preset_file_path.display()));
+            });
+        });
     }
 
     fn advance(&mut self) {
@@ -766,12 +1176,403 @@ impl TreeVisualizerApp {
             && self
                 .current_step
                 .as_ref()
-                .map(|step| step.phase == "resolve" && !step.found)
-                .unwrap_or(false)
+                .map(|step| step.phase == "resolve")
+            .unwrap_or(false)
             && self.last_tick.elapsed() >= Duration::from_millis(600)
         {
+            self.record_completed_run_if_needed();
             self.restart();
         }
+    }
+
+    fn effective_max_attempts(&self) -> usize {
+        compute_visualizer_max_attempts(
+            self.node_count.max(1) as usize,
+            self.max_attempts_factor,
+            self.use_attempt_ratio.then_some(self.max_attempts_ratio),
+            self.use_attempt_cap.then_some(self.max_attempts_cap),
+        )
+    }
+
+    fn parameter_signature(&self) -> String {
+        format!(
+            "nodes={}|tree={}|shell={}|target={}|search={}|algo={}|factor={}|ratio={:?}|cap={:?}|model={}",
+            self.node_count.max(1),
+            self.generation_mode,
+            self.shell_behavior_mode,
+            if self.shell_behavior_mode == "static" { self.shell_target } else { 0 },
+            self.search_controller_mode,
+            self.search_algorithm,
+            self.max_attempts_factor,
+            self.use_attempt_ratio.then_some((self.max_attempts_ratio * 1000.0).round() as i64),
+            self.use_attempt_cap.then_some(self.max_attempts_cap),
+            self.model_bundle_path,
+        )
+    }
+
+    fn record_completed_run_if_needed(&mut self) {
+        if self.recorded_current_run || self.index < self.steps.len() {
+            return;
+        }
+
+        let Some(step) = self.current_step.as_ref() else {
+            return;
+        };
+        if step.phase != "resolve" {
+            return;
+        }
+
+        let attempts = step
+            .attempt
+            .max(step.guess_history.iter().map(|entry| entry.attempt).max().unwrap_or(0))
+            .max(1);
+        let max_attempts = self.active_max_attempts.max(attempts).max(1);
+        let escape_attempts = if step.found { attempts } else { max_attempts } as f64;
+        let survival_ratio = (escape_attempts / max_attempts as f64).clamp(0.0, 1.0);
+        let search_work = self
+            .steps
+            .iter()
+            .map(|step| step.operation_metrics.search_visited)
+            .sum();
+        let shuffle_work = self
+            .steps
+            .iter()
+            .map(|step| step.operation_metrics.shuffle_touched)
+            .sum();
+
+        let prior_epoch_records: Vec<&VisualizationRunRecord> = self
+            .graph_history
+            .iter()
+            .filter(|record| record.epoch == self.active_parameter_epoch)
+            .collect();
+        let prior_count = prior_epoch_records.len() as f64;
+        let prior_escape_sum: f64 = prior_epoch_records
+            .iter()
+            .map(|record| record.escape_attempts)
+            .sum();
+        let prior_found_sum: f64 = prior_epoch_records
+            .iter()
+            .filter(|record| record.found)
+            .count() as f64;
+
+        let denominator = prior_count + 1.0;
+        let running_escape_avg = (prior_escape_sum + escape_attempts) / denominator;
+        let running_found_rate = (prior_found_sum + if step.found { 1.0 } else { 0.0 }) / denominator;
+
+        self.graph_history.push(VisualizationRunRecord {
+            run: self.run_count,
+            epoch: self.active_parameter_epoch,
+            attempts,
+            max_attempts,
+            found: step.found,
+            escape_attempts,
+            survival_ratio,
+            running_escape_avg,
+            running_found_rate,
+            search_work,
+            shuffle_work,
+        });
+        if self.graph_history.len() > self.graph_history_limit {
+            let excess = self.graph_history.len() - self.graph_history_limit;
+            self.graph_history.drain(0..excess);
+        }
+        self.recorded_current_run = true;
+    }
+
+    fn epoch_records(&self) -> Vec<&VisualizationRunRecord> {
+        self.graph_history
+            .iter()
+            .filter(|record| record.epoch == self.active_parameter_epoch)
+            .collect()
+    }
+
+    fn draw_line_chart(
+        ui: &mut egui::Ui,
+        title: &str,
+        series: &[ChartSeries],
+        fixed_min: Option<f64>,
+        fixed_max: Option<f64>,
+        height: f32,
+    ) {
+        ui.label(egui::RichText::new(title).strong());
+        let desired = egui::vec2(ui.available_width().max(220.0), height);
+        let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        let bg = parse_hex_color("#171a1d");
+        let grid = parse_hex_color("#3b424a");
+        let text = parse_hex_color("#d6d0c5");
+        painter.rect_filled(rect, 8.0, bg);
+
+        let plot_rect = rect.shrink2(egui::vec2(34.0, 22.0));
+        let max_len = series.iter().map(|s| s.values.len()).max().unwrap_or(0);
+        if max_len == 0 || series.iter().all(|s| s.values.iter().all(|v| !v.is_finite())) {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No completed visualization runs yet",
+                egui::FontId::proportional(12.0),
+                text,
+            );
+            return;
+        }
+
+        let mut y_min = fixed_min.unwrap_or(f64::INFINITY);
+        let mut y_max = fixed_max.unwrap_or(f64::NEG_INFINITY);
+        if fixed_min.is_none() || fixed_max.is_none() {
+            for value in series.iter().flat_map(|s| s.values.iter().copied()) {
+                if value.is_finite() {
+                    if fixed_min.is_none() {
+                        y_min = y_min.min(value);
+                    }
+                    if fixed_max.is_none() {
+                        y_max = y_max.max(value);
+                    }
+                }
+            }
+        }
+        if !y_min.is_finite() || !y_max.is_finite() {
+            y_min = 0.0;
+            y_max = 1.0;
+        }
+        if (y_max - y_min).abs() < f64::EPSILON {
+            y_min -= 1.0;
+            y_max += 1.0;
+        } else if fixed_min.is_none() || fixed_max.is_none() {
+            let pad = (y_max - y_min) * 0.08;
+            if fixed_min.is_none() {
+                y_min -= pad;
+            }
+            if fixed_max.is_none() {
+                y_max += pad;
+            }
+        }
+
+        for i in 0..=4 {
+            let t = i as f32 / 4.0;
+            let y = egui::lerp(plot_rect.bottom()..=plot_rect.top(), t);
+            painter.line_segment(
+                [egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.right(), y)],
+                egui::Stroke::new(1.0, grid.linear_multiply(0.55)),
+            );
+            let label_value = y_min + (y_max - y_min) * t as f64;
+            painter.text(
+                egui::pos2(rect.left() + 4.0, y),
+                egui::Align2::LEFT_CENTER,
+                format!("{label_value:.1}"),
+                egui::FontId::monospace(9.0),
+                text.linear_multiply(0.82),
+            );
+        }
+
+        for chart in series {
+            let points: Vec<egui::Pos2> = chart
+                .values
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, value)| {
+                    if !value.is_finite() {
+                        return None;
+                    }
+                    let x_t = if max_len <= 1 {
+                        0.5
+                    } else {
+                        idx as f32 / (max_len - 1) as f32
+                    };
+                    let y_t = ((*value - y_min) / (y_max - y_min)).clamp(0.0, 1.0) as f32;
+                    Some(egui::pos2(
+                        egui::lerp(plot_rect.left()..=plot_rect.right(), x_t),
+                        egui::lerp(plot_rect.bottom()..=plot_rect.top(), y_t),
+                    ))
+                })
+                .collect();
+
+            for window in points.windows(2) {
+                painter.line_segment(
+                    [window[0], window[1]],
+                    egui::Stroke::new(2.0, chart.color),
+                );
+            }
+            if let Some(last) = points.last() {
+                painter.circle_filled(*last, 3.5, chart.color);
+            }
+        }
+
+        let mut legend_x = plot_rect.left();
+        for chart in series {
+            painter.circle_filled(
+                egui::pos2(legend_x + 5.0, rect.bottom() - 10.0),
+                4.0,
+                chart.color,
+            );
+            painter.text(
+                egui::pos2(legend_x + 14.0, rect.bottom() - 10.0),
+                egui::Align2::LEFT_CENTER,
+                chart.name,
+                egui::FontId::proportional(10.0),
+                text,
+            );
+            legend_x += 92.0;
+        }
+    }
+
+    fn draw_graphs(&self, ui: &mut egui::Ui) {
+        ui.heading("Graphs");
+        ui.label("Session history from completed visualizer runs. Rolling averages reset when run parameters change.");
+
+        let epoch_records = self.epoch_records();
+        let latest = self.graph_history.last();
+        let controller_label = if self.search_controller_mode == "model" {
+            "model"
+        } else {
+            "selected searcher"
+        };
+        let epoch_count = epoch_records.len();
+        let running_escape_avg = latest
+            .filter(|record| record.epoch == self.active_parameter_epoch)
+            .map(|record| record.running_escape_avg)
+            .unwrap_or(0.0);
+        let running_found_rate = latest
+            .filter(|record| record.epoch == self.active_parameter_epoch)
+            .map(|record| record.running_found_rate)
+            .unwrap_or(0.0);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Runs recorded: {}", self.graph_history.len()));
+            ui.separator();
+            ui.label(format!("Current parameter epoch: {epoch_count} run(s)"));
+            ui.separator();
+            ui.label(format!(
+                "Running avg escape attempts ({controller_label}): {running_escape_avg:.2}"
+            ));
+            ui.separator();
+            ui.label(format!("Found rate: {:.1}%", running_found_rate * 100.0));
+        });
+
+        ui.add_space(6.0);
+
+        let all_attempts: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| record.escape_attempts)
+            .collect();
+        let all_running: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| {
+                if record.epoch == self.active_parameter_epoch {
+                    record.running_escape_avg
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect();
+        Self::draw_line_chart(
+            ui,
+            "Escape Attempts Per Visualization",
+            &[
+                ChartSeries {
+                    name: "attempts",
+                    values: all_attempts,
+                    color: parse_hex_color("#f4a261"),
+                },
+                ChartSeries {
+                    name: "running avg",
+                    values: all_running,
+                    color: parse_hex_color("#2ec4b6"),
+                },
+            ],
+            Some(0.0),
+            None,
+            130.0,
+        );
+
+        ui.add_space(8.0);
+
+        let survival: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| record.survival_ratio * 100.0)
+            .collect();
+        let found_rate: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| record.running_found_rate * 100.0)
+            .collect();
+        Self::draw_line_chart(
+            ui,
+            "Survival % And Rolling Found %",
+            &[
+                ChartSeries {
+                    name: "survival",
+                    values: survival,
+                    color: parse_hex_color("#ffd166"),
+                },
+                ChartSeries {
+                    name: "found avg",
+                    values: found_rate,
+                    color: parse_hex_color("#ef476f"),
+                },
+            ],
+            Some(0.0),
+            Some(100.0),
+            130.0,
+        );
+
+        ui.add_space(8.0);
+
+        let search_work: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| record.search_work as f64)
+            .collect();
+        let shuffle_work: Vec<f64> = self
+            .graph_history
+            .iter()
+            .map(|record| record.shuffle_work as f64)
+            .collect();
+        Self::draw_line_chart(
+            ui,
+            "Search Work vs Shuffle Work",
+            &[
+                ChartSeries {
+                    name: "search",
+                    values: search_work,
+                    color: parse_hex_color("#8ecae6"),
+                },
+                ChartSeries {
+                    name: "shuffle",
+                    values: shuffle_work,
+                    color: parse_hex_color("#a7c957"),
+                },
+            ],
+            Some(0.0),
+            None,
+            130.0,
+        );
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Recent Visualization History").strong());
+        egui::Grid::new("visualization_history_grid")
+            .striped(true)
+            .num_columns(6)
+            .show(ui, |ui| {
+                ui.strong("Run");
+                ui.strong("Epoch");
+                ui.strong("Outcome");
+                ui.strong("Attempts");
+                ui.strong("Survive");
+                ui.strong("Avg");
+                ui.end_row();
+                for record in self.graph_history.iter().rev().take(8) {
+                    ui.label(record.run.to_string());
+                    ui.label(record.epoch.to_string());
+                    ui.label(if record.found { "found" } else { "escaped" });
+                    ui.label(format!("{}/{}", record.attempts, record.max_attempts));
+                    ui.label(format!("{:.0}%", record.survival_ratio * 100.0));
+                    ui.label(format!("{:.2}", record.running_escape_avg));
+                    ui.end_row();
+                }
+            });
     }
 
     fn draw_snapshot(
@@ -851,6 +1652,7 @@ impl TreeVisualizerApp {
 impl eframe::App for TreeVisualizerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.maybe_advance();
+        self.record_completed_run_if_needed();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.heading("Adaptive Shell Tree");
@@ -882,7 +1684,7 @@ impl eframe::App for TreeVisualizerApp {
                             String::new()
                         };
                         format!(
-                            "Search phase{} | visited={} nodes | search={} | shell={}",
+                            "Search phase{} | lookup visited={} nodes | search={} | shell={}",
                             shell_text,
                             step.operation_metrics.search_visited,
                             self.search_controller_mode,
@@ -937,6 +1739,8 @@ impl eframe::App for TreeVisualizerApp {
         });
 
         egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
+            self.draw_presets(ui);
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.label("Speed");
                 ui.add(egui::Slider::new(&mut self.delay_ms, 5..=1000).text("ms"));
@@ -1034,6 +1838,16 @@ impl eframe::App for TreeVisualizerApp {
                 effective_budget
             ));
         });
+
+        egui::SidePanel::right("graphs")
+            .resizable(true)
+            .default_width(390.0)
+            .min_width(300.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    self.draw_graphs(ui);
+                });
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let step = self.current_step.clone().unwrap_or_else(|| HuntStep {

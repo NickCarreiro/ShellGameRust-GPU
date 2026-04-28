@@ -33,6 +33,13 @@ fn cuda_training_uses_gpu_backend_not_cpu() {
         hall_sample_count: 1,
         static_opponent_sample_count: 1,
         training_mode: TrainingMode::CoAgent,
+        es_lr: 0.01,
+        patience: None,
+        stagnation_grow_after: None,
+        stagnation_node_step: 0,
+        stagnation_population_step: 0,
+        stagnation_max_nodes_cap: None,
+        stagnation_population_cap: None,
     });
 
     let _ = std::fs::remove_dir_all(&output_dir);

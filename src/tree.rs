@@ -375,10 +375,9 @@ impl AdaptiveShuffleTree {
         best_fresh.or(best_any).map(|(_, _, node)| node)
     }
 
-    fn relocate_shell_after_miss(&mut self, recent_guess_keys: &[i32]) {
-        if let Some(candidate) = self.choose_shell_relocation_candidate(recent_guess_keys) {
-            self.shell_node = Some(candidate);
-        }
+    fn choose_shell_relocation_key(&self, recent_guess_keys: &[i32]) -> Option<i32> {
+        self.choose_shell_relocation_candidate(recent_guess_keys)
+            .map(|node| node.borrow().key)
     }
 
     fn relocate_shell_to_existing_key(&mut self, key: i32) -> Result<(), String> {
@@ -507,7 +506,18 @@ impl AdaptiveShuffleTree {
     }
 
     pub fn guess_shell_with_history(&mut self, key: i32, recent_guess_keys: &[i32]) -> bool {
-        self.guess_shell_with_relocator(key, recent_guess_keys, None)
+        self.guess_shell_with_history_and_splay(key, recent_guess_keys, true)
+    }
+
+    pub fn guess_shell_with_history_and_splay(
+        &mut self,
+        key: i32,
+        recent_guess_keys: &[i32],
+        splay_on_hit: bool,
+    ) -> bool {
+        self.guess_shell_after_miss(key, splay_on_hit, |tree| {
+            tree.choose_shell_relocation_key(recent_guess_keys)
+        })
     }
 
     pub fn guess_shell_with_relocator(
@@ -516,10 +526,28 @@ impl AdaptiveShuffleTree {
         recent_guess_keys: &[i32],
         relocate_to: Option<i32>,
     ) -> bool {
+        match relocate_to {
+            Some(relocate_key) => self.guess_shell_after_miss(key, true, |_| Some(relocate_key)),
+            None => self.guess_shell_with_history(key, recent_guess_keys),
+        }
+    }
+
+    pub fn guess_shell_without_relocation(&mut self, key: i32, splay_on_hit: bool) -> bool {
+        self.guess_shell_after_miss(key, splay_on_hit, |_| None)
+    }
+
+    pub fn guess_shell_after_miss(
+        &mut self,
+        key: i32,
+        splay_on_hit: bool,
+        relocate_after_shuffle: impl FnOnce(&AdaptiveShuffleTree) -> Option<i32>,
+    ) -> bool {
         let (guessed_node, visited) = self.find_node_with_metrics(key);
         if let (Some(node), Some(shell)) = (&guessed_node, &self.shell_node) {
             if Rc::ptr_eq(node, shell) {
-                self.splay(node.clone());
+                if splay_on_hit {
+                    self.splay(node.clone());
+                }
                 self.last_operation_metrics = OperationMetrics::new("guess-hit", visited, 0, true);
                 self.record_tree_state("guess-hit", Some(key));
                 return true;
@@ -527,10 +555,8 @@ impl AdaptiveShuffleTree {
         }
 
         let touched = self.shuffle_subtree(self.root.clone());
-        if let Some(relocate_key) = relocate_to {
+        if let Some(relocate_key) = relocate_after_shuffle(self) {
             let _ = self.relocate_shell_to_existing_key(relocate_key);
-        } else {
-            self.relocate_shell_after_miss(recent_guess_keys);
         }
         self.last_operation_metrics = OperationMetrics::new("guess-miss", visited, touched, false);
         self.record_tree_state("guess-miss", Some(key));

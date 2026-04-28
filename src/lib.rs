@@ -7,6 +7,6 @@ pub mod visualizer;
 
 pub use shell_finder::{
     build_demo_tree, derive_candidates, derive_candidates_for_strategy, derive_remaining_candidates_for_strategy,
-    derive_target, normalize_search_strategy, HuntResult, HuntStep, SearchStrategy, ShellFinder,
+    derive_target, normalize_search_strategy, HuntResult, HuntStep, MissRelocationPolicy, SearchStrategy, ShellFinder,
 };
 pub use tree::{AdaptiveShuffleTree, HistoryEntry, NodeSnapshot, OperationMetrics, TreeNode};
