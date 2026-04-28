@@ -1,0 +1,22 @@
+{
+  "history": [
+    {
+      "attempt": 29,
+      "found": false,
+      "guess": 83,
+      "shell_key": 48
+    },
+    {
+      "attempt": 30,
+      "found": false,
+      "guess": 10,
+      "shell_key": 101
+    },
+    {
+      "attempt": 31,
+      "found": true,
+      "guess": 101,
+      "shell_key": 101
+    }
+  ]
+}

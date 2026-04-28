@@ -215,6 +215,9 @@ if [[ "$AUTO_GPU_RECOVER" == "1" && -x "$GPU_RECOVERY_SCRIPT" ]]; then
     if (( VIS_STATUS == 0 )); then
       exit 0
     fi
+    if ! grep -qi "CUDA init failed" "$CUDA_LOG"; then
+      exit "$VIS_STATUS"
+    fi
   else
     echo "WARNING: GPU recovery script could not reset/reload the driver." >&2
   fi
