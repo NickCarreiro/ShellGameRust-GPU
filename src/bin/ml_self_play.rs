@@ -49,6 +49,18 @@ enum Command {
         /// Adam learning rate for the OpenAI-ES gradient update.
         #[arg(long, default_value_t = 0.01)]
         es_lr: f64,
+        /// Multiplier applied to es-lr for the learned searcher in coagent mode.
+        #[arg(long, default_value_t = 0.25)]
+        searcher_lr_scale: f64,
+        /// Update the learned searcher every N generations in coagent mode.
+        #[arg(long, default_value_t = 2)]
+        searcher_update_interval: usize,
+        /// Reject learned-searcher updates that push found-rate above this cap.
+        #[arg(long, default_value_t = 0.55)]
+        searcher_max_found_rate: f64,
+        /// Reject learned-searcher updates that jump found-rate too far in one update.
+        #[arg(long, default_value_t = 0.25)]
+        searcher_max_found_rate_jump: f64,
         /// Stop training when evader score does not improve for this many consecutive generations.
         #[arg(long)]
         patience: Option<usize>,
@@ -110,6 +122,10 @@ fn main() -> Result<(), String> {
             static_opponent_sample_count,
             training_mode,
             es_lr,
+            searcher_lr_scale,
+            searcher_update_interval,
+            searcher_max_found_rate,
+            searcher_max_found_rate_jump,
             patience,
             stagnation_grow_after,
             stagnation_node_step,
@@ -138,6 +154,10 @@ fn main() -> Result<(), String> {
                     _ => TrainingMode::Static,
                 },
                 es_lr,
+                searcher_lr_scale,
+                searcher_update_interval,
+                searcher_max_found_rate,
+                searcher_max_found_rate_jump,
                 patience,
                 stagnation_grow_after,
                 stagnation_node_step,

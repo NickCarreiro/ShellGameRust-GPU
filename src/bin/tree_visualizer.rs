@@ -31,6 +31,8 @@ struct Args {
     hide_shell: bool,
     #[arg(long = "auto-rerun", default_value_t = false)]
     auto_rerun: bool,
+    #[arg(long = "instant-auto-rerun", default_value_t = false)]
+    instant_auto_rerun: bool,
 }
 
 fn main() -> Result<(), String> {
@@ -64,6 +66,7 @@ fn main() -> Result<(), String> {
         args.max_attempts_ratio,
         args.max_attempts_cap,
         args.auto_rerun,
+        args.instant_auto_rerun,
         args.model_bundle,
     );
 

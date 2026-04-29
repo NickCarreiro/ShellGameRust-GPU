@@ -12,7 +12,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -400,6 +400,8 @@ pub struct VisualizerPreset {
     #[serde(default)]
     pub auto_rerun: Option<bool>,
     #[serde(default)]
+    pub instant_auto_rerun: Option<bool>,
+    #[serde(default)]
     pub delay_ms: Option<u64>,
 }
 
@@ -431,6 +433,7 @@ fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset
             max_attempts_cap: Some(40),
             reveal_shell: Some(true),
             auto_rerun: Some(true),
+            instant_auto_rerun: Some(true),
             delay_ms: Some(5),
         },
         VisualizerPreset {
@@ -448,6 +451,7 @@ fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset
             max_attempts_cap: Some(40),
             reveal_shell: Some(true),
             auto_rerun: Some(true),
+            instant_auto_rerun: Some(true),
             delay_ms: Some(5),
         },
         VisualizerPreset {
@@ -465,6 +469,7 @@ fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset
             max_attempts_cap: Some(40),
             reveal_shell: Some(true),
             auto_rerun: Some(true),
+            instant_auto_rerun: Some(true),
             delay_ms: Some(5),
         },
         VisualizerPreset {
@@ -482,6 +487,7 @@ fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset
             max_attempts_cap: None,
             reveal_shell: Some(true),
             auto_rerun: Some(false),
+            instant_auto_rerun: Some(false),
             delay_ms: Some(120),
         },
         VisualizerPreset {
@@ -499,6 +505,7 @@ fn default_visualizer_presets(_current_model_path: &str) -> Vec<VisualizerPreset
             max_attempts_cap: None,
             reveal_shell: Some(true),
             auto_rerun: Some(false),
+            instant_auto_rerun: Some(false),
             delay_ms: Some(160),
         },
     ]
@@ -808,6 +815,9 @@ struct VisualizationRunRecord {
     running_found_rate: f64,
     search_work: usize,
     shuffle_work: usize,
+    node_keys: Vec<i32>,
+    searcher_node_hits: BTreeMap<i32, usize>,
+    evader_node_hits: BTreeMap<i32, usize>,
 }
 
 struct ChartSeries {
@@ -832,6 +842,7 @@ pub struct TreeVisualizerApp {
     pub use_attempt_cap: bool,
     pub paused: bool,
     pub auto_rerun: bool,
+    pub instant_auto_rerun: bool,
     pub run_count: usize,
     pub steps: Vec<HuntStep>,
     pub index: usize,
@@ -866,6 +877,7 @@ impl TreeVisualizerApp {
         max_attempts_ratio: Option<f64>,
         max_attempts_cap: Option<usize>,
         auto_rerun: bool,
+        instant_auto_rerun: bool,
         model_bundle_path: String,
     ) -> Self {
         let (presets, preset_file_path, preset_warning) = load_visualizer_presets(&model_bundle_path);
@@ -885,6 +897,7 @@ impl TreeVisualizerApp {
             use_attempt_cap: max_attempts_cap.is_some(),
             paused: false,
             auto_rerun,
+            instant_auto_rerun,
             run_count: 1,
             steps,
             index: 0,
@@ -980,6 +993,9 @@ impl TreeVisualizerApp {
         if let Some(auto_rerun) = preset.auto_rerun {
             self.auto_rerun = auto_rerun;
         }
+        if let Some(instant_auto_rerun) = preset.instant_auto_rerun {
+            self.instant_auto_rerun = instant_auto_rerun;
+        }
         if let Some(delay_ms) = preset.delay_ms {
             self.delay_ms = delay_ms.max(5);
         }
@@ -1014,6 +1030,7 @@ impl TreeVisualizerApp {
             max_attempts_cap: self.use_attempt_cap.then_some(self.max_attempts_cap),
             reveal_shell: Some(self.reveal_shell),
             auto_rerun: Some(self.auto_rerun),
+            instant_auto_rerun: Some(self.instant_auto_rerun),
             delay_ms: Some(self.delay_ms.max(5)),
         }
     }
@@ -1103,7 +1120,7 @@ impl TreeVisualizerApp {
 
             if let Some(preset) = self.presets.get(self.selected_preset) {
                 ui.label(format!(
-                    "{} | nodes={} {} | shell={} | search={}{} | budget factor={} ratio={} cap={} | model={}",
+                    "{} | nodes={} {} | shell={} | search={}{} | budget factor={} ratio={} cap={} | rerun={} | model={}",
                     preset.name,
                     preset.node_count,
                     normalize_generation_mode(&preset.generation_mode),
@@ -1123,6 +1140,14 @@ impl TreeVisualizerApp {
                         .max_attempts_cap
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "off".to_string()),
+                    match (
+                        preset.auto_rerun.unwrap_or(false),
+                        preset.instant_auto_rerun.unwrap_or(false),
+                    ) {
+                        (true, true) => "instant",
+                        (true, false) => "delayed",
+                        (false, _) => "off",
+                    },
                     if preset.model_bundle_path.trim().is_empty()
                         || preset.model_bundle_path.trim() == CURRENT_MODEL_PLACEHOLDER
                     {
@@ -1167,18 +1192,26 @@ impl TreeVisualizerApp {
             if self.last_tick.elapsed() >= Duration::from_millis(delay) {
                 self.advance();
             }
-        } else if self.last_tick.elapsed() >= Duration::from_millis(120) {
-            self.advance();
+        } else {
+            let initial_delay_ms = if self.auto_rerun && self.instant_auto_rerun {
+                0
+            } else {
+                120
+            };
+            if self.last_tick.elapsed() >= Duration::from_millis(initial_delay_ms) {
+                self.advance();
+            }
         }
 
+        let rerun_delay_ms = if self.instant_auto_rerun { 0 } else { 600 };
         if self.index >= self.steps.len()
             && self.auto_rerun
             && self
                 .current_step
                 .as_ref()
                 .map(|step| step.phase == "resolve")
-            .unwrap_or(false)
-            && self.last_tick.elapsed() >= Duration::from_millis(600)
+                .unwrap_or(false)
+            && self.last_tick.elapsed() >= Duration::from_millis(rerun_delay_ms)
         {
             self.record_completed_run_if_needed();
             self.restart();
@@ -1208,6 +1241,101 @@ impl TreeVisualizerApp {
             self.use_attempt_cap.then_some(self.max_attempts_cap),
             self.model_bundle_path,
         )
+    }
+
+    fn collect_snapshot_keys(snapshot: Option<&NodeSnapshot>, keys: &mut Vec<i32>) {
+        let Some(node) = snapshot else {
+            return;
+        };
+        keys.push(node.key);
+        Self::collect_snapshot_keys(node.left.as_deref(), keys);
+        Self::collect_snapshot_keys(node.right.as_deref(), keys);
+    }
+
+    fn count_node_hits_in_steps(
+        steps: &[HuntStep],
+        step_limit: usize,
+    ) -> (Vec<i32>, BTreeMap<i32, usize>, BTreeMap<i32, usize>) {
+        let mut node_keys = Vec::new();
+        for step in steps {
+            Self::collect_snapshot_keys(step.tree_snapshot.as_ref(), &mut node_keys);
+        }
+        node_keys.sort_unstable();
+        node_keys.dedup();
+
+        let mut searcher_hits = BTreeMap::new();
+        let mut evader_hits = BTreeMap::new();
+        for key in &node_keys {
+            searcher_hits.insert(*key, 0);
+            evader_hits.insert(*key, 0);
+        }
+
+        for step in steps.iter().take(step_limit.min(steps.len())) {
+            if step.phase == "search" {
+                if let Some(guess) = step.guess {
+                    *searcher_hits.entry(guess).or_insert(0) += 1;
+                }
+            }
+
+            if matches!(step.phase.as_str(), "hidden" | "resolve") {
+                if let Some(shell_key) = step.shell_key {
+                    *evader_hits.entry(shell_key).or_insert(0) += 1;
+                }
+            }
+        }
+
+        (node_keys, searcher_hits, evader_hits)
+    }
+
+    fn active_node_hit_totals(&self) -> (Vec<i32>, Vec<usize>, Vec<usize>) {
+        let mut node_keys = Vec::new();
+        let mut searcher_hits: BTreeMap<i32, usize> = BTreeMap::new();
+        let mut evader_hits: BTreeMap<i32, usize> = BTreeMap::new();
+
+        for record in self
+            .graph_history
+            .iter()
+            .filter(|record| record.epoch == self.active_parameter_epoch)
+        {
+            node_keys.extend(record.node_keys.iter().copied());
+            for (key, count) in &record.searcher_node_hits {
+                *searcher_hits.entry(*key).or_insert(0) += count;
+            }
+            for (key, count) in &record.evader_node_hits {
+                *evader_hits.entry(*key).or_insert(0) += count;
+            }
+        }
+
+        if !self.recorded_current_run {
+            let (current_keys, current_searcher_hits, current_evader_hits) =
+                Self::count_node_hits_in_steps(&self.steps, self.index.min(self.steps.len()));
+            node_keys.extend(current_keys);
+            for (key, count) in current_searcher_hits {
+                *searcher_hits.entry(key).or_insert(0) += count;
+            }
+            for (key, count) in current_evader_hits {
+                *evader_hits.entry(key).or_insert(0) += count;
+            }
+        }
+
+        if node_keys.is_empty() {
+            for step in &self.steps {
+                Self::collect_snapshot_keys(step.tree_snapshot.as_ref(), &mut node_keys);
+            }
+        }
+
+        node_keys.sort_unstable();
+        node_keys.dedup();
+        let searcher_values = node_keys
+            .iter()
+            .map(|key| searcher_hits.get(key).copied().unwrap_or(0))
+            .collect();
+        let evader_values = node_keys
+            .iter()
+            .map(|key| evader_hits.get(key).copied().unwrap_or(0))
+            .collect();
+
+        (node_keys, searcher_values, evader_values)
     }
 
     fn record_completed_run_if_needed(&mut self) {
@@ -1258,6 +1386,8 @@ impl TreeVisualizerApp {
         let denominator = prior_count + 1.0;
         let running_escape_avg = (prior_escape_sum + escape_attempts) / denominator;
         let running_found_rate = (prior_found_sum + if step.found { 1.0 } else { 0.0 }) / denominator;
+        let (node_keys, searcher_node_hits, evader_node_hits) =
+            Self::count_node_hits_in_steps(&self.steps, self.steps.len());
 
         self.graph_history.push(VisualizationRunRecord {
             run: self.run_count,
@@ -1271,6 +1401,9 @@ impl TreeVisualizerApp {
             running_found_rate,
             search_work,
             shuffle_work,
+            node_keys,
+            searcher_node_hits,
+            evader_node_hits,
         });
         if self.graph_history.len() > self.graph_history_limit {
             let excess = self.graph_history.len() - self.graph_history_limit;
@@ -1415,6 +1548,108 @@ impl TreeVisualizerApp {
         }
     }
 
+    fn draw_node_hit_bar_chart(
+        ui: &mut egui::Ui,
+        title: &str,
+        node_keys: &[i32],
+        counts: &[usize],
+        color: egui::Color32,
+        height: f32,
+        min_width: f32,
+    ) {
+        ui.label(egui::RichText::new(title).strong());
+        let desired = egui::vec2(min_width.max(ui.available_width()).max(260.0), height);
+        let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        let bg = parse_hex_color("#171a1d");
+        let grid = parse_hex_color("#3b424a");
+        let text = parse_hex_color("#d6d0c5");
+        painter.rect_filled(rect, 8.0, bg);
+
+        let plot_rect = rect.shrink2(egui::vec2(36.0, 28.0));
+        if node_keys.is_empty() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No spawned tree nodes yet",
+                egui::FontId::proportional(12.0),
+                text,
+            );
+            return;
+        }
+
+        let max_count = counts.iter().copied().max().unwrap_or(0).max(1);
+        for i in 0..=4 {
+            let t = i as f32 / 4.0;
+            let y = egui::lerp(plot_rect.bottom()..=plot_rect.top(), t);
+            painter.line_segment(
+                [egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.right(), y)],
+                egui::Stroke::new(1.0, grid.linear_multiply(0.55)),
+            );
+            let label_value = (max_count as f32 * t).round() as usize;
+            painter.text(
+                egui::pos2(rect.left() + 4.0, y),
+                egui::Align2::LEFT_CENTER,
+                label_value.to_string(),
+                egui::FontId::monospace(9.0),
+                text.linear_multiply(0.82),
+            );
+        }
+
+        let n = node_keys.len().max(1);
+        let slot_width = plot_rect.width() / n as f32;
+        let bar_width = (slot_width * 0.72).max(1.0);
+        for (idx, key) in node_keys.iter().enumerate() {
+            let count = counts.get(idx).copied().unwrap_or(0);
+            let x_center = plot_rect.left() + (idx as f32 + 0.5) * slot_width;
+            let y_t = count as f32 / max_count as f32;
+            let y_top = egui::lerp(plot_rect.bottom()..=plot_rect.top(), y_t);
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(x_center - bar_width / 2.0, y_top),
+                egui::pos2(x_center + bar_width / 2.0, plot_rect.bottom()),
+            );
+            painter.rect_filled(bar_rect, 2.0, color);
+
+            let label_every = ((n as f32 / 12.0).ceil() as usize).max(1);
+            if idx == 0 || idx + 1 == n || idx % label_every == 0 {
+                painter.text(
+                    egui::pos2(x_center, rect.bottom() - 12.0),
+                    egui::Align2::CENTER_CENTER,
+                    key.to_string(),
+                    egui::FontId::monospace(8.5),
+                    text.linear_multiply(0.78),
+                );
+            }
+        }
+
+        if let Some(pointer) = response.hover_pos() {
+            if plot_rect.contains(pointer) {
+                let idx = ((pointer.x - plot_rect.left()) / slot_width)
+                    .floor()
+                    .clamp(0.0, (n - 1) as f32) as usize;
+                let x_center = plot_rect.left() + (idx as f32 + 0.5) * slot_width;
+                painter.line_segment(
+                    [
+                        egui::pos2(x_center, plot_rect.top()),
+                        egui::pos2(x_center, plot_rect.bottom()),
+                    ],
+                    egui::Stroke::new(1.0, text.linear_multiply(0.6)),
+                );
+                painter.text(
+                    egui::pos2(x_center + 6.0, plot_rect.top() + 10.0),
+                    egui::Align2::LEFT_CENTER,
+                    format!(
+                        "node {}: {}",
+                        node_keys[idx],
+                        counts.get(idx).copied().unwrap_or(0)
+                    ),
+                    egui::FontId::monospace(10.0),
+                    text,
+                );
+            }
+        }
+    }
+
     fn draw_graphs(&self, ui: &mut egui::Ui) {
         ui.heading("Graphs");
         ui.label("Session history from completed visualizer runs. Rolling averages reset when run parameters change.");
@@ -1549,6 +1784,42 @@ impl TreeVisualizerApp {
             None,
             130.0,
         );
+
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Node Hit Counts").strong());
+        ui.label(
+            egui::RichText::new(concat!(
+                "Auto-populated from the spawned tree. Searcher counts guesses; ",
+                "evader counts shell spawn/relocation nodes for the current parameter epoch.",
+            ))
+            .small(),
+        );
+        let (node_keys, searcher_node_hits, evader_node_hits) = self.active_node_hit_totals();
+        let chart_width = (node_keys.len() as f32 * 8.0 + 48.0).max(ui.available_width());
+        egui::ScrollArea::horizontal()
+            .id_salt("node_hit_counts_scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                Self::draw_node_hit_bar_chart(
+                    ui,
+                    "Searcher Hits By Node",
+                    &node_keys,
+                    &searcher_node_hits,
+                    parse_hex_color("#8ecae6"),
+                    140.0,
+                    chart_width,
+                );
+                ui.add_space(8.0);
+                Self::draw_node_hit_bar_chart(
+                    ui,
+                    "Evader Hits By Node",
+                    &node_keys,
+                    &evader_node_hits,
+                    parse_hex_color("#f4a261"),
+                    140.0,
+                    chart_width,
+                );
+            });
 
         ui.add_space(8.0);
         ui.label(egui::RichText::new("Recent Visualization History").strong());
@@ -1818,6 +2089,9 @@ impl eframe::App for TreeVisualizerApp {
 
                 ui.checkbox(&mut self.reveal_shell, "Reveal shell");
                 ui.checkbox(&mut self.auto_rerun, "Auto-rerun");
+                ui.add_enabled_ui(self.auto_rerun, |ui| {
+                    ui.checkbox(&mut self.instant_auto_rerun, "Instant rerun");
+                });
                 let pause_label = if self.paused { "Resume" } else { "Pause" };
                 if ui.button(pause_label).clicked() {
                     self.paused = !self.paused;

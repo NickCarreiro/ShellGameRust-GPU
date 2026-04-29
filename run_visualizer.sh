@@ -13,6 +13,7 @@
 #   GENERATION=uneven tree shape: balanced|uneven (default: uneven)
 #   HIDE_SHELL=1      hide the shell position indicator
 #   AUTO_RERUN=1      automatically restart after each episode
+#   INSTANT_AUTO_RERUN=1  remove the post-episode auto-rerun pause entirely
 #   SHELL_BEHAVIOR=adaptive  shell behavior: static|random|adaptive (default: adaptive)
 #   SEARCHER=model    search controller: algorithm|model (default: model)
 #   ALGORITHM=evasion-aware  used when SEARCHER=algorithm
@@ -20,7 +21,12 @@
 #   CORE_MODEL_DIR=models/core       where to auto-detect core models from (default: models/core)
 #   USE_CUDA=0        build/run the visualizer CPU-only
 #   AUTO_GPU_RECOVER=1  try recover_gpu.sh if CUDA init fails (default: 1)
-#   CPU_FALLBACK=1    after failed recovery, launch with CPU fallback instead of aborting
+#   GPU_RECOVERY_ALLOW_PROMPT=1  allow sudo password prompt during recovery
+#   GPU_RECOVERY_SCRIPT=./recover_gpu.sh  override the no-reboot recovery helper
+#   CUDA_RECOVERY_RETRIES=3  CUDA launch attempts before giving up
+#   CUDA_HEALTH_CHECK=1  run supervised CUDA matmul + batched MLP stress probe first
+#   GPU_SINGLE_SCORE_ROWS=4096  cap rows per single-model CUDA MLP call
+#   CPU_FALLBACK=1    opt into CPU fallback after CUDA recovery retries fail
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -124,11 +130,19 @@ SEARCHER="${SEARCHER:-model}"
 ALGORITHM="${ALGORITHM:-evasion-aware}"
 HIDE_SHELL="${HIDE_SHELL:-0}"
 AUTO_RERUN="${AUTO_RERUN:-0}"
+INSTANT_AUTO_RERUN="${INSTANT_AUTO_RERUN:-0}"
 MAX_ATTEMPTS_FACTOR="${MAX_ATTEMPTS_FACTOR:-2}"
+GPU_SINGLE_SCORE_ROWS="${GPU_SINGLE_SCORE_ROWS:-4096}"
 USE_CUDA="${USE_CUDA:-1}"
 AUTO_GPU_RECOVER="${AUTO_GPU_RECOVER:-1}"
-CPU_FALLBACK="${CPU_FALLBACK:-1}"
+CPU_FALLBACK="${CPU_FALLBACK:-0}"
+GPU_RECOVERY_ALLOW_PROMPT="${GPU_RECOVERY_ALLOW_PROMPT:-1}"
 GPU_RECOVERY_SCRIPT="${GPU_RECOVERY_SCRIPT:-$(pwd)/recover_gpu.sh}"
+CUDA_RECOVERY_RETRIES="${CUDA_RECOVERY_RETRIES:-3}"
+CUDA_HEALTH_CHECK="${CUDA_HEALTH_CHECK:-1}"
+CUDA_HEALTH_BIN="$(pwd)/target/release/cuda_health"
+export GPU_RECOVERY_ALLOW_PROMPT
+export GPU_SINGLE_SCORE_ROWS
 
 CARGO_FEATURE_ARGS=()
 if [[ "$USE_CUDA" == "0" ]]; then
@@ -143,16 +157,32 @@ fi
 
 echo "Model:    $MODEL_BUNDLE"
 echo "Nodes:    $NODES  Generation: $GENERATION  Shell: $SHELL_BEHAVIOR  Searcher: $SEARCHER"
+echo "Rerun:    auto=$AUTO_RERUN instant=$INSTANT_AUTO_RERUN"
 echo "CUDA:     use=$USE_CUDA recover=$AUTO_GPU_RECOVER fallback_cpu=$CPU_FALLBACK"
+echo "GPU rows: single_model=$GPU_SINGLE_SCORE_ROWS"
 echo "Recovery: $GPU_RECOVERY_SCRIPT"
+echo "Sudo:     gpu_recovery_prompt=$GPU_RECOVERY_ALLOW_PROMPT"
+echo "Retries:  cuda=$CUDA_RECOVERY_RETRIES health_check=$CUDA_HEALTH_CHECK"
 
-cargo build --release "${CARGO_FEATURE_ARGS[@]}" --bin tree_visualizer 2>&1 | grep -v "^$" | grep -v "Compiling candle-kernels"
+build_visualizer_binary() {
+  cargo build --release "$@" --bin tree_visualizer 2>&1 | grep -v "^$" | grep -v "Compiling candle-kernels"
+}
+
+build_visualizer_binary "${CARGO_FEATURE_ARGS[@]}"
+if [[ "$USE_CUDA" != "0" && "$CUDA_HEALTH_CHECK" == "1" ]]; then
+  cargo build --release --bin cuda_health 2>&1 | grep -v "^$" | grep -v "Compiling candle-kernels"
+fi
+CPU_BUILD_READY=0
+if [[ "$USE_CUDA" == "0" ]]; then
+  CPU_BUILD_READY=1
+fi
 
 # ── Extra flags ────────────────────────────────────────────────────────────────
 
 EXTRA_FLAGS=()
 [[ "$HIDE_SHELL" == "1" ]] && EXTRA_FLAGS+=(--hide-shell)
 [[ "$AUTO_RERUN" == "1" ]] && EXTRA_FLAGS+=(--auto-rerun)
+[[ "$INSTANT_AUTO_RERUN" == "1" ]] && EXTRA_FLAGS+=(--instant-auto-rerun)
 [[ -n "${MAX_ATTEMPTS_CAP:-}"   ]] && EXTRA_FLAGS+=(--max-attempts-cap   "$MAX_ATTEMPTS_CAP")
 [[ -n "${MAX_ATTEMPTS_RATIO:-}" ]] && EXTRA_FLAGS+=(--max-attempts-ratio "$MAX_ATTEMPTS_RATIO")
 
@@ -172,65 +202,148 @@ VISUALIZER_CMD=(
 )
 
 CUDA_LOG="$(mktemp /tmp/shellgame_visualizer_cuda.XXXXXX.log)"
-trap 'rm -f "$CUDA_LOG"' EXIT
+CUDA_HEALTH_LOG="$(mktemp /tmp/shellgame_visualizer_cuda_health.XXXXXX.log)"
+trap 'rm -f "$CUDA_LOG" "$CUDA_HEALTH_LOG"' EXIT
+
+is_cuda_failure_log() {
+  local log_path="$1"
+  grep -Eqi 'CUDA_ERROR|DriverError\(CUDA|unspecified launch failure|cudarc|cuda_backend|CudaSlice|GPU .*failed|CUDA .*failed' "$log_path"
+}
 
 run_visualizer_once() {
   local require_cuda="$1"
   if [[ "$require_cuda" == "1" ]]; then
-    REQUIRE_CUDA=1 "${VISUALIZER_CMD[@]}" 2>&1 | tee "$CUDA_LOG"
+    CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}" REQUIRE_CUDA=1 "${VISUALIZER_CMD[@]}" 2>&1 | tee "$CUDA_LOG"
     return "${PIPESTATUS[0]}"
   fi
 
   "${VISUALIZER_CMD[@]}"
 }
 
+run_cuda_health_once() {
+  CUDA_LAUNCH_BLOCKING=1 \
+    REQUIRE_CUDA=1 \
+    CUDA_HEALTH_SINGLE_ROWS="${CUDA_HEALTH_SINGLE_ROWS:-$GPU_SINGLE_SCORE_ROWS}" \
+    "$CUDA_HEALTH_BIN" 2>&1 | tee "$CUDA_HEALTH_LOG"
+  return "${PIPESTATUS[0]}"
+}
+
+recover_gpu_if_enabled() {
+  if [[ "$AUTO_GPU_RECOVER" == "1" && -x "$GPU_RECOVERY_SCRIPT" ]]; then
+    echo "Attempting no-reboot GPU recovery..."
+    if "$GPU_RECOVERY_SCRIPT"; then
+      echo "GPU recovery completed."
+      return 0
+    else
+      echo "WARNING: GPU recovery script could not reset/reload the driver." >&2
+      return 1
+    fi
+  elif [[ "$AUTO_GPU_RECOVER" == "1" ]]; then
+    echo "WARNING: GPU recovery script is missing or not executable: $GPU_RECOVERY_SCRIPT" >&2
+    return 1
+  fi
+
+  echo "WARNING: automatic GPU recovery is disabled; not retrying unsafe CUDA." >&2
+  return 1
+}
+
+ensure_cuda_healthy() {
+  if [[ "$CUDA_HEALTH_CHECK" != "1" ]]; then
+    return 0
+  fi
+
+  for ((health_try = 1; health_try <= CUDA_RECOVERY_RETRIES; health_try++)); do
+    echo
+    echo "CUDA health probe $health_try/$CUDA_RECOVERY_RETRIES"
+    : > "$CUDA_HEALTH_LOG"
+    set +e
+    run_cuda_health_once
+    local health_status=$?
+    set -e
+    if (( health_status == 0 )); then
+      return 0
+    fi
+    if ! is_cuda_failure_log "$CUDA_HEALTH_LOG"; then
+      return "$health_status"
+    fi
+    if (( health_try >= CUDA_RECOVERY_RETRIES )); then
+      return "$health_status"
+    fi
+    if ! recover_gpu_if_enabled; then
+      echo "ERROR: GPU recovery failed; refusing to relaunch CUDA into a poisoned driver context." >&2
+      return "$health_status"
+    fi
+  done
+}
+
+launch_cpu_visualizer() {
+  echo
+  echo "Launching visualizer with the CPU-only build."
+  if [[ "${CPU_BUILD_READY:-0}" != "1" ]]; then
+    build_visualizer_binary --no-default-features
+  fi
+  SHELLGAME_FORCE_CPU=1 exec "${VISUALIZER_CMD[@]}"
+}
+
 if [[ "$USE_CUDA" == "0" ]]; then
-  exec "${VISUALIZER_CMD[@]}"
+  launch_cpu_visualizer
 fi
 
-set +e
-run_visualizer_once 1
-VIS_STATUS=$?
-set -e
-
-if (( VIS_STATUS == 0 )); then
-  exit 0
-fi
-
-if ! grep -qi "CUDA init failed" "$CUDA_LOG"; then
+if ensure_cuda_healthy; then
+  :
+else
+  VIS_STATUS=$?
+  echo "ERROR: CUDA health probe failed before launching the visualizer." >&2
+  if [[ "$CPU_FALLBACK" == "1" ]]; then
+    echo "CPU_FALLBACK=1 is set; launching CPU-only visualizer." >&2
+    launch_cpu_visualizer
+  fi
   exit "$VIS_STATUS"
 fi
 
-echo
-echo "CUDA init failed before the visualizer window opened."
-if [[ "$AUTO_GPU_RECOVER" == "1" && -x "$GPU_RECOVERY_SCRIPT" ]]; then
-  echo "Attempting no-reboot GPU recovery..."
-  if "$GPU_RECOVERY_SCRIPT"; then
-    echo "GPU recovery completed; retrying visualizer with CUDA required."
-    : > "$CUDA_LOG"
-    set +e
-    run_visualizer_once 1
-    VIS_STATUS=$?
-    set -e
-    if (( VIS_STATUS == 0 )); then
-      exit 0
-    fi
-    if ! grep -qi "CUDA init failed" "$CUDA_LOG"; then
-      exit "$VIS_STATUS"
-    fi
-  else
-    echo "WARNING: GPU recovery script could not reset/reload the driver." >&2
+VIS_STATUS=1
+for ((cuda_try = 1; cuda_try <= CUDA_RECOVERY_RETRIES; cuda_try++)); do
+  echo
+  echo "CUDA visualizer launch attempt $cuda_try/$CUDA_RECOVERY_RETRIES"
+  : > "$CUDA_LOG"
+  set +e
+  run_visualizer_once 1
+  VIS_STATUS=$?
+  set -e
+
+  if (( VIS_STATUS == 0 )); then
+    exit 0
   fi
-elif [[ "$AUTO_GPU_RECOVER" == "1" ]]; then
-  echo "WARNING: GPU recovery script is missing or not executable: $GPU_RECOVERY_SCRIPT" >&2
-fi
+
+  if ! is_cuda_failure_log "$CUDA_LOG"; then
+    exit "$VIS_STATUS"
+  fi
+
+  echo
+  echo "CUDA failure detected before/during visualizer launch."
+  if (( cuda_try >= CUDA_RECOVERY_RETRIES )); then
+    break
+  fi
+
+  if ! recover_gpu_if_enabled; then
+    echo "ERROR: GPU recovery failed; refusing another CUDA visualizer launch." >&2
+    break
+  fi
+  if ensure_cuda_healthy; then
+    :
+  else
+    VIS_STATUS=$?
+    echo "ERROR: CUDA health probe still fails after recovery." >&2
+    break
+  fi
+done
 
 if [[ "$CPU_FALLBACK" == "1" ]]; then
   echo
-  echo "CUDA is still unavailable; launching visualizer with CPU fallback."
+  echo "CUDA is still unsafe; rebuilding and relaunching visualizer CPU-only."
   echo "Set CPU_FALLBACK=0 to abort instead."
-  exec "${VISUALIZER_CMD[@]}"
+  launch_cpu_visualizer
 fi
 
-echo "ERROR: CUDA is still unavailable and CPU_FALLBACK=0." >&2
+echo "ERROR: CUDA is still unsafe after $CUDA_RECOVERY_RETRIES attempt(s), and CPU_FALLBACK=0." >&2
 exit "$VIS_STATUS"

@@ -20,7 +20,7 @@ echo "Output: $LOG_FILE"
 echo "Process match: $PROCESS_MATCH"
 echo "Press Ctrl-C to stop."
 
-echo "timestamp,cpu_user_pct,cpu_system_pct,cpu_idle_pct,cpu_iowait_pct,mem_used_mib,mem_available_mib,gpu_util_pct,gpu_mem_used_mib,gpu_mem_free_mib,gpu_temp_c,trainer_pid,trainer_cpu_pct,trainer_mem_pct,trainer_rss_kib" > "$LOG_FILE"
+echo "timestamp,cpu_user_pct,cpu_system_pct,cpu_idle_pct,cpu_iowait_pct,mem_used_mib,mem_available_mib,gpu_util_pct,gpu_mem_used_mib,gpu_mem_free_mib,gpu_temp_c,gpu_power_w,gpu_graphics_clock_mhz,trainer_pid,trainer_cpu_pct,trainer_mem_pct,trainer_rss_kib" > "$LOG_FILE"
 
 while true; do
   timestamp="$(date '+%F %T')"
@@ -35,9 +35,9 @@ while true; do
     mem_line=",";
   fi
 
-  gpu_line="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.free,temperature.gpu --format=csv,noheader,nounits | head -n 1 | tr -d ' ')"
+  gpu_line="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.free,temperature.gpu,power.draw,clocks.gr --format=csv,noheader,nounits | head -n 1 | tr -d ' ')"
   if [[ -z "$gpu_line" ]]; then
-    gpu_line=",,,";
+    gpu_line=",,,,,";
   fi
 
   trainer_line="$(ps -C "$PROCESS_MATCH" -o pid=,%cpu=,%mem=,rss= --sort=-%cpu 2>/dev/null | awk 'NR==1 {gsub(/^ +| +$/, ""); gsub(/ +/, ","); print; exit}' || true)"
